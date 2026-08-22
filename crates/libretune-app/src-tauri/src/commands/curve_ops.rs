@@ -1,6 +1,9 @@
 //! Curve get/update commands.
 
+use crate::commands::constant_values::collect_scalar_constant_values;
+use crate::commands::string_context::{build_string_context, numeric_context_from_tune};
 use crate::AppState;
+use libretune_core::ini::expression::{evaluate_display_string, evaluate_numeric_string};
 use libretune_core::ini::Constant;
 use libretune_core::protocol::Connection;
 use libretune_core::tune::TuneFile;
@@ -87,8 +90,8 @@ pub async fn get_curve_data(
     let curve_title = curve.title.clone();
     let x_label = curve.column_labels.0.clone();
     let y_label = curve.column_labels.1.clone();
-    let x_axis = curve.x_axis;
-    let y_axis = curve.y_axis;
+    let x_axis_raw = curve.x_axis.clone();
+    let y_axis_raw = curve.y_axis.clone();
     let x_output_channel = curve.x_output_channel.clone();
     let gauge = curve.gauge.clone();
 
@@ -222,6 +225,59 @@ pub async fn get_curve_data(
 
     let x_bins = read_const_from_source(&x_const, tune_guard.as_ref(), &mut conn, endianness)?;
     let y_bins = read_const_from_source(&y_const, tune_guard.as_ref(), &mut conn, endianness)?;
+
+    drop(conn_guard);
+    drop(tune_guard);
+
+    // column_labels can be a braced INI expression (e.g. bitStringValue(...))
+    // rather than a literal string - resolve it the same way tables do.
+    let string_ctx = build_string_context(&state).await;
+    let numeric = {
+        // Lock order matches get_gauge_config: definition -> cache -> tune.
+        let def_guard = state.definition.lock().await;
+        let cache_guard = state.tune_cache.lock().await;
+        let tune = state.current_tune.lock().await;
+        let mut base = numeric_context_from_tune(tune.as_ref());
+        if let Some(def) = def_guard.as_ref() {
+            // Many MSQs (and "Use LibreTune Settings" saves) store data as
+            // raw pageData blobs rather than named <constant> tags, so a
+            // constant like useMetricOnInterface - which an xAxis bound's
+            // helper expression depends on - is absent from
+            // numeric_context_from_tune above. Fill any such gaps from the
+            // decoded page cache, the same source get_constant_value falls
+            // back to for a single lookup.
+            base.extend(collect_scalar_constant_values(
+                def,
+                tune.as_ref(),
+                cache_guard.as_ref(),
+            ));
+            // xAxis/yAxis bounds and scale/translate fields often *name* a
+            // computed output-channel helper (`{ iatHighXaxis }`) rather than
+            // a real constant - resolve those into context too, or the bare
+            // name evaluates to 0 (evaluate()'s default for an unknown
+            // variable) instead of the helper's actual value.
+            base = def.context_with_output_channel_helpers(&base);
+        }
+        base
+    };
+    let x_label = evaluate_display_string(&x_label, &numeric, Some(&string_ctx));
+    let y_label = evaluate_display_string(&y_label, &numeric, Some(&string_ctx));
+
+    // xAxis/yAxis components can each be a braced expression too (e.g. the
+    // high bound `{ cltHighXaxis }`, a ternary on the metric/imperial PC
+    // variable) - a bound that fails to evaluate is dropped entirely rather
+    // than guessed at, so the frontend falls back to the bins' own range
+    // instead of silently clamping edits to a wrong number.
+    let resolve_axis = |raw: &Option<(String, String, String)>| -> Option<(f32, f32, f32)> {
+        let (min, max, step) = raw.as_ref()?;
+        Some((
+            evaluate_numeric_string(min, &numeric, Some(&string_ctx))?,
+            evaluate_numeric_string(max, &numeric, Some(&string_ctx))?,
+            evaluate_numeric_string(step, &numeric, Some(&string_ctx))?,
+        ))
+    };
+    let x_axis = resolve_axis(&x_axis_raw);
+    let y_axis = resolve_axis(&y_axis_raw);
 
     Ok(CurveData {
         name: curve_name_out,
