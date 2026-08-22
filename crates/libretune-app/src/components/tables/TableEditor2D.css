@@ -54,9 +54,9 @@
   max-width: 100%;
 }
 
-/* veTableTbl only: give the grid a real viewport to fit into */
-.table-editor-2d.table-editor-2d--ve-fit.embedded .editor-content,
-.table-editor-2d.table-editor-2d--ve-fit.embedded .editor-content.editor-content--with-live {
+/* Tables embedded in a dialog panel: give the grid a real viewport to fit into. */
+.table-editor-2d.table-editor-2d--fit-panel.embedded .editor-content,
+.table-editor-2d.table-editor-2d--fit-panel.embedded .editor-content.editor-content--with-live {
   flex: 1 1 auto;
   align-self: stretch;
   width: 100%;
@@ -81,7 +81,7 @@
   scrollbar-gutter: stable both-edges;
 }
 
-.table-editor-2d .table-grid-container--fit-ve {
+.table-editor-2d .table-grid-container--fit-panel {
   /* Still content-sized; host is the scroll/measure box */
   width: max-content;
   height: max-content;

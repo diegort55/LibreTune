@@ -371,8 +371,9 @@ export default function TableGrid({
     );
   };
 
-  // Fixed column widths — tuning tables must not stretch with the panel.
-  // Exception: fitViewport (veTableTbl only) sizes cells from the parent box.
+  // Fixed column widths in the standalone full-tab view — tuning tables
+  // must not stretch there. Exception: fitViewport (tables embedded in a
+  // dialog panel) sizes cells from the parent box instead.
   useLayoutEffect(() => {
     if (!fitViewport) {
       setFitPx(null);
@@ -457,7 +458,7 @@ export default function TableGrid({
   const grid = (
     <div
       ref={gridRef}
-      className={`table-grid-container${compact ? ' table-grid-container--compact' : ''}${fitViewport ? ' table-grid-container--fit-ve' : ''}`}
+      className={`table-grid-container${compact ? ' table-grid-container--compact' : ''}${fitViewport ? ' table-grid-container--fit-panel' : ''}`}
       onMouseUp={handleMouseUp}
       onMouseMove={handleCellMouseMove}
       style={gridStyle}
