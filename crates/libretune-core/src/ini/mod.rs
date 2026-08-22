@@ -480,14 +480,20 @@ impl EcuDefinition {
     /// `values` maps constant name to current value (display units). Call
     /// after a tune is loaded, and again if a constant that feeds one of these
     /// expressions changes. Returns the number of constants updated.
-    pub fn resolve_dynamic_scales(
-        &mut self,
+    /// Augment a numeric context with this definition's computed output
+    /// channels (`{ useMetricOnInterface ? 120 : 248 }`-style helpers, named
+    /// like `cltHighXaxis`/`iatHighXaxis`/`fuelLoadRes`). An expression that
+    /// only *names* one of these - a curve's `xAxis = -40, { iatHighXaxis }, 9`,
+    /// a constant's `scale = { fuelLoadRes }` - otherwise evaluates the bare
+    /// name to 0 (expression::evaluate's default for an unknown variable),
+    /// since the helper's own value was never a real measured constant.
+    /// Two passes let a helper depend on another helper without ordering
+    /// assumptions. `values` wins over a helper of the same name (a real
+    /// measured value always beats a computed one).
+    pub fn context_with_output_channel_helpers(
+        &self,
         values: &std::collections::HashMap<String, f64>,
-    ) -> usize {
-        // A scale expression usually names a computed helper rather than a
-        // constant (`{fuelLoadRes}`), and those helpers live among the output
-        // channels, so evaluate them into the context first. Two passes let a
-        // helper depend on another helper without ordering assumptions.
+    ) -> std::collections::HashMap<String, f64> {
         let mut context = values.clone();
         for _ in 0..2 {
             for (name, channel) in &self.output_channels {
@@ -508,6 +514,17 @@ impl EcuDefinition {
                 }
             }
         }
+        context
+    }
+
+    pub fn resolve_dynamic_scales(
+        &mut self,
+        values: &std::collections::HashMap<String, f64>,
+    ) -> usize {
+        // A scale expression usually names a computed helper rather than a
+        // constant (`{fuelLoadRes}`), and those helpers live among the output
+        // channels, so evaluate them into the context first.
+        let context = self.context_with_output_channel_helpers(values);
 
         let mut updated = 0;
         for constant in self.constants.values_mut() {
@@ -716,6 +733,39 @@ mod tests {
 
         // Idempotent: re-resolving with unchanged inputs updates nothing.
         assert_eq!(def.resolve_dynamic_scales(&values), 0);
+    }
+
+    /// A curve's `xAxis = -40, { iatHighXaxis }, 9` names a computed
+    /// output-channel helper directly, not through a constant's scale field.
+    /// Without resolving `iatHighXaxis` into the context first, the bare
+    /// name evaluates to 0 (expression::evaluate's default for an unknown
+    /// variable) rather than the helper's real 120/248 - a wrong axis bound
+    /// that then silently clamps every edit back toward the low end.
+    #[test]
+    fn context_with_output_channel_helpers_resolves_named_helper() {
+        let mut def = EcuDefinition::default();
+        def.output_channels.insert(
+            "iatHighXaxis".to_string(),
+            OutputChannel {
+                name: "iatHighXaxis".to_string(),
+                expression: Some("useMetricOnInterface ? 120 : 248".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut values = std::collections::HashMap::new();
+        values.insert("useMetricOnInterface".to_string(), 1.0);
+        let ctx = def.context_with_output_channel_helpers(&values);
+        assert_eq!(ctx.get("iatHighXaxis"), Some(&120.0));
+
+        values.insert("useMetricOnInterface".to_string(), 0.0);
+        let ctx = def.context_with_output_channel_helpers(&values);
+        assert_eq!(ctx.get("iatHighXaxis"), Some(&248.0));
+
+        // A real measured value of the same name always wins over the helper.
+        values.insert("iatHighXaxis".to_string(), 999.0);
+        let ctx = def.context_with_output_channel_helpers(&values);
+        assert_eq!(ctx.get("iatHighXaxis"), Some(&999.0));
     }
 
     /// A literal scale must never be treated as a deferred expression.

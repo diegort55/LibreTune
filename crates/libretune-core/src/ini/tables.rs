@@ -229,11 +229,13 @@ pub struct CurveDefinition {
     /// Column labels (X label, Y label)
     pub column_labels: (String, String),
 
-    /// X-axis range and step (min, max, step)
-    pub x_axis: Option<(f32, f32, f32)>,
+    /// X-axis range and step (min, max, step), each raw and possibly a
+    /// braced expression (e.g. `{ cltHighXaxis }`) - resolved against a live
+    /// numeric context when the curve's data is fetched, not at parse time.
+    pub x_axis: Option<(String, String, String)>,
 
-    /// Y-axis range and step (min, max, step)
-    pub y_axis: Option<(f32, f32, f32)>,
+    /// Y-axis range and step (min, max, step); see `x_axis`.
+    pub y_axis: Option<(String, String, String)>,
 
     /// Size (width, height) - number of points
     pub size: Option<usize>,

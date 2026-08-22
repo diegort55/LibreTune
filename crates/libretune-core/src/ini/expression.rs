@@ -1187,6 +1187,32 @@ pub fn evaluate_display_string(
     }
 }
 
+/// Resolve a numeric field that may be a literal or a braced INI expression
+/// (e.g. a curve's `xAxis = -40, { cltHighXaxis }, 9`, where the high bound
+/// depends on a PC variable). Returns `None` if `raw` is neither a plain
+/// number nor an expression that evaluates to a finite one - callers should
+/// treat that as "not configured" rather than substituting a default, since
+/// a wrong axis bound silently clamps every edit to it.
+pub fn evaluate_numeric_string(
+    raw: &str,
+    context: &HashMap<String, f64>,
+    string_context: Option<&StringContext>,
+) -> Option<f32> {
+    let trimmed = raw.trim();
+    let value = if trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.len() >= 2 {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if inner.is_empty() {
+            return None;
+        }
+        let mut parser = Parser::new(inner);
+        let expr = parser.parse().ok()?;
+        evaluate(&expr, context, string_context).ok()?.as_f64()
+    } else {
+        trimmed.parse::<f64>().ok()?
+    };
+    value.is_finite().then_some(value as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,5 +1385,41 @@ mod tests {
             evaluate_display_string("Engine Speed", &context, None),
             "Engine Speed"
         );
+    }
+
+    #[test]
+    fn evaluate_numeric_string_resolves_literals_and_braced_expressions() {
+        let mut context = HashMap::new();
+        context.insert("useMetricOnInterface".to_string(), 1.0);
+
+        // Plain literal, whitespace tolerated.
+        assert_eq!(evaluate_numeric_string(" 9 ", &context, None), Some(9.0));
+
+        // A curve's xAxis high bound is often a ternary on a PC variable
+        // (rusEFI's `cltHighXaxis = { useMetricOnInterface ? 120 : 248 }`).
+        assert_eq!(
+            evaluate_numeric_string(
+                "{ useMetricOnInterface ? 120 : 248 }",
+                &context,
+                None
+            ),
+            Some(120.0)
+        );
+        context.insert("useMetricOnInterface".to_string(), 0.0);
+        assert_eq!(
+            evaluate_numeric_string(
+                "{ useMetricOnInterface ? 120 : 248 }",
+                &context,
+                None
+            ),
+            Some(248.0)
+        );
+    }
+
+    #[test]
+    fn evaluate_numeric_string_rejects_garbage_instead_of_guessing() {
+        let context = HashMap::new();
+        assert_eq!(evaluate_numeric_string("not a number", &context, None), None);
+        assert_eq!(evaluate_numeric_string("{ }", &context, None), None);
     }
 }

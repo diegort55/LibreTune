@@ -1728,8 +1728,12 @@ fn parse_curve_editor_entry(
         if let Some(curve) = def.curves.get_mut(curve_name) {
             match key.to_lowercase().as_str() {
                 "columnlabel" => {
-                    // Format: columnLabel = "X Label", "Y Label"
-                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    // Format: columnLabel = "X Label", "Y Label" - a label can
+                    // itself be a braced expression with commas of its own
+                    // (e.g. {bitStringValue(pwmAxisLabels, blendParam)}), so a
+                    // naive split(',') cuts it in half. split_ini_line keeps
+                    // braced/quoted commas intact.
+                    let parts = split_ini_line(value);
                     if parts.len() >= 2 {
                         curve.column_labels = (
                             parts[0].trim_matches('"').to_string(),
@@ -1738,29 +1742,22 @@ fn parse_curve_editor_entry(
                     }
                 }
                 "xaxis" => {
-                    // Format: xAxis = min, max, step
-                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    // Format: xAxis = min, max, step - any component can be a
+                    // braced expression (e.g. `{ cltHighXaxis }`, itself a
+                    // ternary on a PC variable), so keep the raw text and
+                    // resolve it against a live numeric context when the
+                    // curve's data is fetched rather than requiring a
+                    // literal number here.
+                    let parts = split_ini_line(value);
                     if parts.len() >= 3 {
-                        if let (Ok(min), Ok(max), Ok(step)) = (
-                            parts[0].parse::<f32>(),
-                            parts[1].parse::<f32>(),
-                            parts[2].parse::<f32>(),
-                        ) {
-                            curve.x_axis = Some((min, max, step));
-                        }
+                        curve.x_axis = Some((parts[0].clone(), parts[1].clone(), parts[2].clone()));
                     }
                 }
                 "yaxis" => {
-                    // Format: yAxis = min, max, step
-                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    // Format: yAxis = min, max, step; see "xaxis" above.
+                    let parts = split_ini_line(value);
                     if parts.len() >= 3 {
-                        if let (Ok(min), Ok(max), Ok(step)) = (
-                            parts[0].parse::<f32>(),
-                            parts[1].parse::<f32>(),
-                            parts[2].parse::<f32>(),
-                        ) {
-                            curve.y_axis = Some((min, max, step));
-                        }
+                        curve.y_axis = Some((parts[0].clone(), parts[1].clone(), parts[2].clone()));
                     }
                 }
                 "xbins" => {
@@ -3279,11 +3276,71 @@ fn parse_constants_extensions_entry(def: &mut EcuDefinition, key: &str, value: &
 mod tests {
     use super::*;
 
+    /// A curve's `columnLabel` can itself be a braced expression with a
+    /// comma of its own (rusEFI's real INI does this for every blend
+    /// curve: `{bitStringValue(pwmAxisLabels, secondVeBlendParameter)}`).
+    /// A naive `split(',')` cut that expression in half at the inner comma,
+    /// leaving `x_label` as the unterminated `"{bitStringValue(pwmAxisLabels"`
+    /// and `y_label` as the orphaned `"secondVeBlendParameter)}"` - both
+    /// rendered raw in the curve's axis label and column headers instead of
+    /// evaluating to the selected axis name ("Zero", "RPM", ...).
+    #[test]
+    fn curve_column_label_expression_comma_is_not_a_separator() {
+        let ini = "[CurveEditor]
+curve = secondVeBias, \"Second VE blend bias\"
+columnLabel = {bitStringValue(pwmAxisLabels, secondVeBlendParameter)}, \"bias %\"
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("secondVeBias").expect("curve parsed");
+        assert_eq!(
+            curve.column_labels,
+            (
+                "{bitStringValue(pwmAxisLabels, secondVeBlendParameter)}".to_string(),
+                "bias %".to_string(),
+            )
+        );
+    }
+
+    /// rusEFI's real INI gives every temperature curve an `xAxis` whose high
+    /// bound is a PC-variable ternary, not a literal:
+    /// `xAxis = -40, { iatHighXaxis }, 9`. The old parser required all three
+    /// components to parse as `f32` and dropped the *entire* axis (min and
+    /// step included) the moment one didn't - so the frontend fell back to
+    /// computing bounds from the curve's own current bin values, which can
+    /// only ever shrink toward whatever the bins already are. Editing the
+    /// coldest bin to anything below its current value then silently
+    /// clamped right back to what was already there, since parsing must
+    /// preserve the raw expression text for evaluation later (it needs a
+    /// live tune value that isn't available yet at parse time).
+    #[test]
+    fn curve_x_axis_expression_bound_is_not_dropped() {
+        let ini = "[CurveEditor]
+curve = iatFuelCorrCurve, \"Intake air temperature fuel Multiplier\"
+xAxis = -40, { iatHighXaxis }, 9
+yAxis = 0, 2, 11
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("iatFuelCorrCurve").expect("curve parsed");
+        assert_eq!(
+            curve.x_axis,
+            Some((
+                "-40".to_string(),
+                "{ iatHighXaxis }".to_string(),
+                "9".to_string(),
+            ))
+        );
+        assert_eq!(
+            curve.y_axis,
+            Some(("0".to_string(), "2".to_string(), "11".to_string()))
+        );
+    }
+
     /// An INI picks metric units with `#if CELSIUS`. TunerStudio defines that
     /// from the project's `ecuSettings`; nothing carried it into LibreTune, so
     /// the Fahrenheit `#else` arm always won and a 23 degC cold start read 73
     /// on the gauge under a generic "TEMP" label.
     #[test]
+    #[serial_test::serial(default_symbols)]
     fn celsius_symbol_selects_the_metric_branch() {
         let ini = concat!(
             "[Constants]
@@ -3332,6 +3389,7 @@ mod tests {
     /// plausible. Keeping the answer on the definition also means this holds
     /// with other parses running concurrently.
     #[test]
+    #[serial_test::serial(default_symbols)]
     fn a_definition_remembers_the_symbols_it_was_parsed_with() {
         let ini = "[Constants]
 page = 1
