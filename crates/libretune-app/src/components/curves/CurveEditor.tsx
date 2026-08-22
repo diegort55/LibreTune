@@ -471,7 +471,41 @@ export default function CurveEditor({
     }
   }, [history, historyIndex, persistCurveValues]);
 
-  // Keyboard shortcuts for undo/redo
+  // Nudge the selected point's Y value with the keyboard (Up/Down; Shift for
+  // a bigger step) - the chart only lets you drag Y, so that is what arrow
+  // keys move too. Step is relative to the axis range since curves cover
+  // wildly different scales (a 0-100% bias vs. a +/-10 degree trim).
+  const nudgeSelectedPoint = useCallback(
+    (direction: 1 | -1, big: boolean) => {
+      if (selectedPoint === null) return;
+      const range = yAxis.max - yAxis.min;
+      const step = big ? Math.max(range * 0.05, 1) : Math.max(range * 0.01, 0.1);
+      const current = localYBins[selectedPoint] ?? 0;
+      const clamped = Math.max(yAxis.min, Math.min(yAxis.max, current + step * direction));
+      const next = [...localYBins];
+      next[selectedPoint] = clamped;
+      pushHistory();
+      setLocalYBins(next);
+      persistCurveValues(localXBins, next);
+    },
+    [selectedPoint, yAxis, localYBins, localXBins, pushHistory, persistCurveValues],
+  );
+
+  // Left/Right moves the selection to the previous/next bin, so once you've
+  // arrowed a point's value into place you can keep going down the curve
+  // without reaching for the mouse.
+  const moveSelectionBy = useCallback(
+    (delta: 1 | -1) => {
+      if (selectedPoint === null || localXBins.length === 0) return;
+      const next = Math.max(0, Math.min(localXBins.length - 1, selectedPoint + delta));
+      setSelectedPoint(next);
+    },
+    [selectedPoint, localXBins.length],
+  );
+
+  // Keyboard shortcuts: undo/redo, Up/Down to nudge the selected point's
+  // value, Left/Right to move the selection (disabled while a table cell is
+  // mid-edit, where arrows should be free for normal text-input behavior).
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
@@ -480,15 +514,21 @@ export default function CurveEditor({
       } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
         e.preventDefault();
         redo();
+      } else if (!editingCell && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        e.preventDefault();
+        nudgeSelectedPoint(e.key === 'ArrowUp' ? 1 : -1, e.shiftKey);
+      } else if (!editingCell && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        e.preventDefault();
+        moveSelectionBy(e.key === 'ArrowRight' ? 1 : -1);
       }
     };
-    
+
     const container = containerRef.current;
     if (container) {
       container.addEventListener('keydown', handleKeyDown);
       return () => container.removeEventListener('keydown', handleKeyDown);
     }
-  }, [undo, redo]);
+  }, [undo, redo, editingCell, nudgeSelectedPoint, moveSelectionBy]);
 
   // Handle mouse down on a point - push history first
   const handlePointMouseDown = (e: React.MouseEvent, index: number) => {
@@ -498,6 +538,11 @@ export default function CurveEditor({
     setIsDragging(true);
     setDragPointIndex(index);
     setSelectedPoint(index);
+    // preventDefault above blocks the browser's usual click-to-focus, but
+    // the arrow-key nudge below needs this container focused to receive
+    // the keydown at all - without this, selecting a point and pressing
+    // an arrow key does nothing.
+    containerRef.current?.focus();
   };
 
   /** Move the currently dragged point to the given clientY (shared by point-grab, chart-grab, and window listeners). */
@@ -546,6 +591,7 @@ export default function CurveEditor({
     setSelectedPoint(nearest);
     // Immediately snap the grabbed point to the clicked Y
     updateDragFromClientY(e.clientY, nearest);
+    containerRef.current?.focus();
   };
 
   // Handle mouse up to end dragging
@@ -621,6 +667,7 @@ export default function CurveEditor({
   // Handle row click to select
   const handleRowClick = (index: number) => {
     setSelectedPoint(index);
+    containerRef.current?.focus();
   };
 
   // Context menu handlers
@@ -754,60 +801,53 @@ Suggestion: {errorInfo.suggestion}
 
   console.log(`[CurveEditor] Rendering curve '${data.name}' in ${embedded ? 'embedded' : 'standalone'} mode with ${localXBins.length} points`);
 
-  const renderCurveTableBody = () =>
-    localXBins.map((x, i) => {
-      const xValue = x ?? 0;
-      const yValue = localYBins[i] ?? 0;
-      const xCellStyle = getHeatmapCellStyle(xValue, xAxis.min, xAxis.max);
-      const yCellStyle = getHeatmapCellStyle(yValue, yAxis.min, yAxis.max);
-      const editingX = editingCell?.index === i && editingCell.axis === 'x';
-      const editingY = editingCell?.index === i && editingCell.axis === 'y';
+  // TunerStudio lays this out as two rows (Y values, then X values) with one
+  // column per bin, not one row per bin - a tall N-row/2-column list reads
+  // as a wall of numbers next to a wide chart, where a 2-row strip reads at
+  // a glance and matches the axes it labels left-to-right under the plot.
+  const renderCurveTableAxisRow = (axis: 'x' | 'y', label: string, values: (number | undefined)[], range: { min: number; max: number }) => (
+    <tr key={axis}>
+      <th className="curve-table-row-label">{label}</th>
+      {values.map((v, i) => {
+        const value = v ?? 0;
+        const cellStyle = getHeatmapCellStyle(value, range.min, range.max);
+        const editing = editingCell?.index === i && editingCell.axis === axis;
 
-      return (
-        <tr
-          key={i}
-          className={selectedPoint === i ? 'selected' : ''}
-          onClick={() => handleRowClick(i)}
-        >
+        return (
           <td
-            className="x-cell"
-            style={xCellStyle}
-            onDoubleClick={() => handleCellDoubleClick(i, 'x')}
+            key={i}
+            className={`${axis}-cell${selectedPoint === i ? ' selected' : ''}`}
+            style={cellStyle}
+            onClick={() => handleRowClick(i)}
+            onDoubleClick={() => handleCellDoubleClick(i, axis)}
           >
-            {editingX ? (
+            {editing ? (
               <input
                 type="text"
                 value={editValue}
                 onChange={(e) => setEditValue(e.target.value)}
-                onKeyDown={(e) => handleCellKeyDown(e, i, 'x')}
-                onBlur={() => handleCellBlur(i, 'x')}
+                onKeyDown={(e) => handleCellKeyDown(e, i, axis)}
+                onBlur={() => handleCellBlur(i, axis)}
                 autoFocus
               />
             ) : (
-              xValue.toFixed(2)
+              // TunerStudio's own bin-value strip shows one decimal place
+              // ("14.5", not "14.30") - matching it also buys back the width
+              // this table needs to fit its columns without scrolling.
+              value.toFixed(1)
             )}
           </td>
-          <td
-            className="y-cell"
-            style={yCellStyle}
-            onDoubleClick={() => handleCellDoubleClick(i, 'y')}
-          >
-            {editingY ? (
-              <input
-                type="text"
-                value={editValue}
-                onChange={(e) => setEditValue(e.target.value)}
-                onKeyDown={(e) => handleCellKeyDown(e, i, 'y')}
-                onBlur={() => handleCellBlur(i, 'y')}
-                autoFocus
-              />
-            ) : (
-              yValue.toFixed(2)
-            )}
-          </td>
-        </tr>
-      );
-    });
+        );
+      })}
+    </tr>
+  );
+
+  const renderCurveTableBody = () => (
+    <>
+      {renderCurveTableAxisRow('y', data.y_label, localYBins, yAxis)}
+      {renderCurveTableAxisRow('x', data.x_label, localXBins, xAxis)}
+    </>
+  );
 
   return (
     <div
@@ -996,12 +1036,6 @@ Suggestion: {errorInfo.suggestion}
           <div className="curve-bottom-section">
             <div className="curve-data-table">
           <table>
-            <thead>
-              <tr>
-                <th>{data.x_label}</th>
-                <th>{data.y_label}</th>
-              </tr>
-            </thead>
             <tbody>{renderCurveTableBody()}</tbody>
           </table>
         </div>
@@ -1018,12 +1052,6 @@ Suggestion: {errorInfo.suggestion}
           /* Standalone mode: table beside chart */
           <div className="curve-data-table">
             <table>
-              <thead>
-                <tr>
-                  <th>{data.x_label}</th>
-                  <th>{data.y_label}</th>
-                </tr>
-              </thead>
               <tbody>{renderCurveTableBody()}</tbody>
             </table>
           </div>
