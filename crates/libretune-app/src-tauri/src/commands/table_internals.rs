@@ -21,6 +21,12 @@ pub(crate) struct TableData {
     pub x_output_channel: Option<String>,
     /// Output channel name for Y-axis (used for live cell highlighting)
     pub y_output_channel: Option<String>,
+    /// INI's `xBins = ..., readOnly` - this axis tracks a fixed reference
+    /// (e.g. Long Term Fuel Trim mirroring the VE table's own bins) and must
+    /// not be edited from this view.
+    pub x_bins_read_only: bool,
+    /// See `x_bins_read_only`.
+    pub y_bins_read_only: bool,
     /// Present when the INI declares TunerStudio dynamically sized arrays.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_info: Option<TableSizeInfoDto>,
@@ -87,6 +93,8 @@ pub(crate) async fn get_table_data_internal(
         .unwrap_or_else(|| table.y_bins.clone().unwrap_or_default());
     let x_output_channel = table.x_output_channel.clone();
     let y_output_channel = table.y_output_channel.clone();
+    let x_bins_read_only = table.x_bins_read_only;
+    let y_bins_read_only = table.y_bins_read_only;
 
     let x_const = def
         .constants
@@ -242,6 +250,8 @@ pub(crate) async fn get_table_data_internal(
         y_axis_name: evaluate_display_string(&y_label, &numeric, Some(&string_ctx)),
         x_output_channel,
         y_output_channel,
+        x_bins_read_only,
+        y_bins_read_only,
         size_info,
     })
 }

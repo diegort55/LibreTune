@@ -62,6 +62,10 @@ export interface BackendTableData {
   z_values: number[][];
   x_output_channel?: string | null;
   y_output_channel?: string | null;
+  /** INI's `xBins = ..., readOnly` - this axis tracks a fixed reference (no bin-editing UI exists for tables yet, but the flag is captured for when one does). */
+  x_bins_read_only?: boolean;
+  /** See `x_bins_read_only`. */
+  y_bins_read_only?: boolean;
 }
 
 export interface CurveData {
@@ -74,6 +78,10 @@ export interface CurveData {
   x_axis?: [number, number, number] | null;
   y_axis?: [number, number, number] | null;
   x_output_channel?: string | null;
+  /** INI's `xBins = ..., readOnly` - this axis tracks a fixed reference and must not be edited here. */
+  x_bins_read_only?: boolean;
+  /** See `x_bins_read_only`. */
+  y_bins_read_only?: boolean;
   gauge?: string | null;
 }
 

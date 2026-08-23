@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Save, Flame, Undo2, Redo2, AlertTriangle } from 'lucide-react';
+import { ArrowLeft, Save, Flame, Undo2, Redo2, AlertTriangle, Lock } from 'lucide-react';
 import { GaugeLiveReadout } from '../gauges/GaugeLiveReadout';
 import { TsGaugeConfig } from '../dashboards/dashTypes';
 import { valueToHeatmapColor, textColorForBackground } from '../../utils/heatmapColors';
@@ -103,6 +103,10 @@ export interface CurveData {
   x_axis?: [number, number, number] | null; // [min, max, step]
   y_axis?: [number, number, number] | null;
   x_output_channel?: string | null;
+  /** INI's `xBins = ..., readOnly` - this axis tracks a fixed reference and must not be edited here. */
+  x_bins_read_only?: boolean;
+  /** See `x_bins_read_only`. */
+  y_bins_read_only?: boolean;
   gauge?: string | null;
 }
 
@@ -477,7 +481,7 @@ export default function CurveEditor({
   // wildly different scales (a 0-100% bias vs. a +/-10 degree trim).
   const nudgeSelectedPoint = useCallback(
     (direction: 1 | -1, big: boolean) => {
-      if (selectedPoint === null) return;
+      if (selectedPoint === null || data.y_bins_read_only) return;
       const range = yAxis.max - yAxis.min;
       const step = big ? Math.max(range * 0.05, 1) : Math.max(range * 0.01, 0.1);
       const current = localYBins[selectedPoint] ?? 0;
@@ -488,7 +492,7 @@ export default function CurveEditor({
       setLocalYBins(next);
       persistCurveValues(localXBins, next);
     },
-    [selectedPoint, yAxis, localYBins, localXBins, pushHistory, persistCurveValues],
+    [selectedPoint, yAxis, localYBins, localXBins, pushHistory, persistCurveValues, data.y_bins_read_only],
   );
 
   // Left/Right moves the selection to the previous/next bin, so once you've
@@ -534,15 +538,19 @@ export default function CurveEditor({
   const handlePointMouseDown = (e: React.MouseEvent, index: number) => {
     e.preventDefault();
     e.stopPropagation();
-    pushHistory(); // Save state before editing
-    setIsDragging(true);
-    setDragPointIndex(index);
     setSelectedPoint(index);
     // preventDefault above blocks the browser's usual click-to-focus, but
     // the arrow-key nudge below needs this container focused to receive
     // the keydown at all - without this, selecting a point and pressing
     // an arrow key does nothing.
     containerRef.current?.focus();
+    // Dragging only ever moves Y (see updateDragFromClientY) - a curve
+    // whose INI marks yBins readOnly stays selectable/navigable, just not
+    // draggable.
+    if (data.y_bins_read_only) return;
+    pushHistory(); // Save state before editing
+    setIsDragging(true);
+    setDragPointIndex(index);
   };
 
   /** Move the currently dragged point to the given clientY (shared by point-grab, chart-grab, and window listeners). */
@@ -585,13 +593,14 @@ export default function CurveEditor({
       }
     });
     e.preventDefault();
+    setSelectedPoint(nearest);
+    containerRef.current?.focus();
+    if (data.y_bins_read_only) return;
     pushHistory();
     setIsDragging(true);
     setDragPointIndex(nearest);
-    setSelectedPoint(nearest);
     // Immediately snap the grabbed point to the clicked Y
     updateDragFromClientY(e.clientY, nearest);
-    containerRef.current?.focus();
   };
 
   // Handle mouse up to end dragging
@@ -626,7 +635,24 @@ export default function CurveEditor({
       }
 
       if (axis === 'x') {
-        const clamped = Math.max(xAxis.min, Math.min(xAxis.max, parsed));
+        let clamped = Math.max(xAxis.min, Math.min(xAxis.max, parsed));
+        // X bins must stay sorted - the ECU looks a curve up by walking
+        // them in order, so a bin edited past its neighbor silently
+        // reorders the axis (e.g. editing -10.0 to -35 produced
+        // [-35, -40, -20, ...], out of order) without any error. Clamp to
+        // the neighbors instead, in whichever direction this curve's bins
+        // already run.
+        const ascending =
+          localXBins.length < 2 || localXBins[0] <= localXBins[localXBins.length - 1];
+        const prev = index > 0 ? localXBins[index - 1] : undefined;
+        const next = index < localXBins.length - 1 ? localXBins[index + 1] : undefined;
+        if (ascending) {
+          if (prev !== undefined) clamped = Math.max(clamped, prev);
+          if (next !== undefined) clamped = Math.min(clamped, next);
+        } else {
+          if (prev !== undefined) clamped = Math.min(clamped, prev);
+          if (next !== undefined) clamped = Math.max(clamped, next);
+        }
         const newXBins = [...localXBins];
         newXBins[index] = clamped;
         setLocalXBins(newXBins);
@@ -645,6 +671,8 @@ export default function CurveEditor({
 
   // Handle table cell edit
   const handleCellDoubleClick = (index: number, axis: 'x' | 'y') => {
+    const readOnly = axis === 'x' ? data.x_bins_read_only : data.y_bins_read_only;
+    if (readOnly) return;
     pushHistory();
     setEditingCell({ index, axis });
     setEditValue(
@@ -805,9 +833,12 @@ Suggestion: {errorInfo.suggestion}
   // column per bin, not one row per bin - a tall N-row/2-column list reads
   // as a wall of numbers next to a wide chart, where a 2-row strip reads at
   // a glance and matches the axes it labels left-to-right under the plot.
-  const renderCurveTableAxisRow = (axis: 'x' | 'y', label: string, values: (number | undefined)[], range: { min: number; max: number }) => (
-    <tr key={axis}>
-      <th className="curve-table-row-label">{label}</th>
+  const renderCurveTableAxisRow = (axis: 'x' | 'y', label: string, values: (number | undefined)[], range: { min: number; max: number }, readOnly: boolean) => (
+    <tr key={axis} className={readOnly ? 'read-only' : ''}>
+      <th className="curve-table-row-label" title={readOnly ? 'Locked by the INI - tracks a fixed reference axis' : undefined}>
+        {label}
+        {readOnly && <Lock size={10} aria-label="Read-only" />}
+      </th>
       {values.map((v, i) => {
         const value = v ?? 0;
         const cellStyle = getHeatmapCellStyle(value, range.min, range.max);
@@ -844,8 +875,8 @@ Suggestion: {errorInfo.suggestion}
 
   const renderCurveTableBody = () => (
     <>
-      {renderCurveTableAxisRow('y', data.y_label, localYBins, yAxis)}
-      {renderCurveTableAxisRow('x', data.x_label, localXBins, xAxis)}
+      {renderCurveTableAxisRow('y', data.y_label, localYBins, yAxis, !!data.y_bins_read_only)}
+      {renderCurveTableAxisRow('x', data.x_label, localXBins, xAxis, !!data.x_bins_read_only)}
     </>
   );
 

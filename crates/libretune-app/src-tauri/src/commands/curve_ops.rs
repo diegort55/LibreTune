@@ -23,6 +23,12 @@ pub struct CurveData {
     pub y_axis: Option<(f32, f32, f32)>,
     /// Output channel name for live cursor (e.g., "coolant")
     pub x_output_channel: Option<String>,
+    /// INI's xBins ... readOnly - this axis tracks a fixed reference (e.g. a
+    /// blend curve's bins mirror the VE table's own RPM axis) and must not
+    /// be edited from this view.
+    pub x_bins_read_only: bool,
+    /// See `x_bins_read_only`.
+    pub y_bins_read_only: bool,
     /// Gauge name for live display
     pub gauge: Option<String>,
 }
@@ -93,6 +99,8 @@ pub async fn get_curve_data(
     let x_axis_raw = curve.x_axis.clone();
     let y_axis_raw = curve.y_axis.clone();
     let x_output_channel = curve.x_output_channel.clone();
+    let x_bins_read_only = curve.x_bins_read_only;
+    let y_bins_read_only = curve.y_bins_read_only;
     let gauge = curve.gauge.clone();
 
     drop(def_guard);
@@ -289,6 +297,8 @@ pub async fn get_curve_data(
         x_axis,
         y_axis,
         x_output_channel,
+        x_bins_read_only,
+        y_bins_read_only,
         gauge,
     })
 }
@@ -389,13 +399,15 @@ pub async fn update_curve_data(
     // conn.write_memory() call starves every other command that needs the
     // definition (e.g. load_tune, table/curve reads). Matches the
     // established pattern in update_constant/update_constant_array_internal.
-    let (x_ctx, x_const, y_ctx, y_const) = {
+    let (x_ctx, x_const, x_bins_read_only, y_ctx, y_const, y_bins_read_only) = {
         let def_guard = state.definition.lock().await;
         let def = def_guard.as_ref().ok_or("Definition not loaded")?;
 
         let curve = def
             .get_curve_by_name_or_map(&curve_name)
             .ok_or_else(|| format!("Curve {} not found", curve_name))?;
+        let x_bins_read_only = curve.x_bins_read_only;
+        let y_bins_read_only = curve.y_bins_read_only;
 
         let x_const_name = curve.x_bins.clone();
         let y_const_name = curve.y_bins.clone();
@@ -437,7 +449,14 @@ pub async fn update_curve_data(
                 .unwrap_or(256) as usize,
         };
 
-        (x_ctx, x_const, y_ctx, y_const)
+        (
+            x_ctx,
+            x_const,
+            x_bins_read_only,
+            y_ctx,
+            y_const,
+            y_bins_read_only,
+        )
     };
 
     let mut conn_guard = state.connection.lock().await;
@@ -450,28 +469,46 @@ pub async fn update_curve_data(
         .ok_or("Tune cache not initialized — open or create a project first")?;
     let mut conn = conn_guard.as_mut();
 
+    // The frontend always resends both axes together (even when only one
+    // changed), so a readOnly axis's incoming values are silently dropped
+    // here rather than rejecting the whole save - the other, editable axis
+    // still needs to persist.
     if let Some(values) = x_values {
-        write_constant_array_values(
-            &x_ctx,
-            &x_const,
-            &values,
-            cache,
-            &mut tune_guard,
-            &mut modified_guard,
-            &mut conn,
-        )?;
+        if x_bins_read_only {
+            eprintln!(
+                "[WARN] update_curve_data: ignoring x_values for readOnly curve '{}'",
+                curve_name
+            );
+        } else {
+            write_constant_array_values(
+                &x_ctx,
+                &x_const,
+                &values,
+                cache,
+                &mut tune_guard,
+                &mut modified_guard,
+                &mut conn,
+            )?;
+        }
     }
 
     if let Some(values) = y_values {
-        write_constant_array_values(
-            &y_ctx,
-            &y_const,
-            &values,
-            cache,
-            &mut tune_guard,
-            &mut modified_guard,
-            &mut conn,
-        )?;
+        if y_bins_read_only {
+            eprintln!(
+                "[WARN] update_curve_data: ignoring y_values for readOnly curve '{}'",
+                curve_name
+            );
+        } else {
+            write_constant_array_values(
+                &y_ctx,
+                &y_const,
+                &values,
+                cache,
+                &mut tune_guard,
+                &mut modified_guard,
+                &mut conn,
+            )?;
+        }
     }
 
     Ok(())
