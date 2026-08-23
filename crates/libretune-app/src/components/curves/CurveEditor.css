@@ -151,6 +151,34 @@
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
+.curve-series-legend {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  max-width: 60%;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+
+.curve-series-legend-entry {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: #ccc;
+  white-space: nowrap;
+}
+
+.curve-series-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
 .curve-editor.embedded .curve-chart-container {
   /* CSS decides the available width (up to the 500px comfort size, down to
      a 320px floor where the SVG stays readable); the component reads the

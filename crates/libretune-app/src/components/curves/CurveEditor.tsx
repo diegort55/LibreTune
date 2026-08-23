@@ -108,7 +108,31 @@ export interface CurveData {
   /** See `x_bins_read_only`. */
   y_bins_read_only?: boolean;
   gauge?: string | null;
+  /** `lineLabel` matched to the primary `y_bins` series when the curve has more than one (§9.2.1). */
+  primary_y_line_label?: string | null;
+  /** Extra reference lines beyond the primary `y_bins` series - read-only here, same X bins. */
+  additional_y_series?: CurveSeriesData[];
 }
+
+/** One extra Y-axis series on a multi-series curve (see `CurveData.additional_y_series`). */
+export interface CurveSeriesData {
+  values: number[];
+  label?: string | null;
+  visible: boolean;
+}
+
+/** Colors for `additional_y_series` lines, distinct from the primary series' yellow (#f5d742)
+ * and the live-cursor's red (#ff4444). Cycles if a curve has more series than colors (rangeMatrix has 11). */
+const ADDITIONAL_SERIES_COLORS = [
+  '#4f8fe8', // blue
+  '#3dba6f', // green
+  '#c069d8', // purple
+  '#e0a030', // orange
+  '#2fc4c4', // teal
+  '#e05252', // muted red (distinct enough from live-cursor red at 0.85 opacity)
+  '#d8d8d8', // light gray
+  '#7f7ff0', // indigo
+];
 
 /** Values edited in a curve table (X = coolant/temperature bins, Y = PWM/output). */
 export interface CurveBinValues {
@@ -1012,6 +1036,28 @@ Suggestion: {errorInfo.suggestion}
               {data.y_label}
             </text>
 
+            {/* Additional Y series (§9.2.1) - reference lines only, not
+                draggable/editable; the primary series below stays the only
+                interactive one. Drawn first so the primary line and its
+                points sit on top. */}
+            {(data.additional_y_series ?? []).map((series, seriesIdx) => {
+              if (!series.visible) return null;
+              const color = ADDITIONAL_SERIES_COLORS[seriesIdx % ADDITIONAL_SERIES_COLORS.length];
+              const points = localXBins
+                .map((x, i) => `${scaleX(x ?? 0)},${scaleY(series.values[i] ?? 0)}`)
+                .join(' ');
+              return (
+                <polyline
+                  key={`series-${seriesIdx}`}
+                  points={points}
+                  fill="none"
+                  stroke={color}
+                  strokeWidth="1.5"
+                  opacity={0.85}
+                />
+              );
+            })}
+
             {/* Data line */}
             <polyline
               points={polylinePoints}
@@ -1060,6 +1106,27 @@ Suggestion: {errorInfo.suggestion}
               </>
             )}
           </svg>
+
+          {/* Multi-series legend (§9.2.1) - only shown when the curve has more than one yBins row */}
+          {!!data.additional_y_series?.length && (
+            <div className="curve-series-legend">
+              <span className="curve-series-legend-entry">
+                <span className="curve-series-swatch" style={{ background: '#f5d742' }} />
+                {data.primary_y_line_label ?? data.y_label}
+              </span>
+              {data.additional_y_series.map((series, i) =>
+                series.visible ? (
+                  <span key={i} className="curve-series-legend-entry">
+                    <span
+                      className="curve-series-swatch"
+                      style={{ background: ADDITIONAL_SERIES_COLORS[i % ADDITIONAL_SERIES_COLORS.length] }}
+                    />
+                    {series.label ?? `Series ${i + 2}`}
+                  </span>
+                ) : null
+              )}
+            </div>
+          )}
         </div>
 
         {/* Bottom section: gauge + data table (embedded only uses stacked layout) */}

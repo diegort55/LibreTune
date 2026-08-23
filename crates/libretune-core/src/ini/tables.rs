@@ -270,6 +270,39 @@ pub struct CurveDefinition {
 
     /// Gauge name for live display (from gauge = GaugeName in INI)
     pub gauge: Option<String>,
+
+    /// `lineLabel` matched to `y_bins` (the first/primary series) when a
+    /// curve has more than one - see `additional_y_series`. rusEFI's
+    /// `rangeMatrix` (11 series) writes every `yBins` line first and every
+    /// `lineLabel` line after, in the same order, rather than interleaving
+    /// them; labels are matched positionally across primary + additional in
+    /// parse order, not by which yBins line they follow.
+    #[serde(default)]
+    pub primary_y_line_label: Option<String>,
+
+    /// One yBins row is required (`y_bins`, above); §9.2.1 allows any number
+    /// of additional rows, each another 1D array reference with an optional
+    /// `{visibility expression}` and its own `lineLabel`, rendered as extra
+    /// color-coded lines on the same chart (rusEFI's `shiftSpeedCurve` has
+    /// 6, `rangeMatrix` has 11). A curve with only the required `yBins`
+    /// leaves this empty.
+    #[serde(default)]
+    pub additional_y_series: Vec<CurveYSeries>,
+}
+
+/// One extra Y-axis array on a multi-series curve (`y_bins` on
+/// [`CurveDefinition`] is always the first/primary series; this is series 2
+/// and on). See [`CurveDefinition::additional_y_series`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CurveYSeries {
+    /// The 1D array constant this series reads its values from.
+    pub bins: String,
+    /// Raw `{expression}` text (unevaluated - needs a live tune context,
+    /// same as `x_axis`/`y_axis`) that decides whether this series is
+    /// currently active/visible. `None` means always visible.
+    pub visibility_expr: Option<String>,
+    /// This series' own axis label, if the INI gave it one.
+    pub line_label: Option<String>,
 }
 
 impl CurveDefinition {
@@ -294,6 +327,8 @@ impl CurveDefinition {
             page: 0,
             help: None,
             gauge: None,
+            primary_y_line_label: None,
+            additional_y_series: Vec::new(),
         }
     }
 }

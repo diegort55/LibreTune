@@ -9,6 +9,19 @@ use libretune_core::protocol::Connection;
 use libretune_core::tune::TuneFile;
 use serde::Serialize;
 
+/// One extra Y-axis line on a multi-series curve (`y_bins` on [`CurveData`]
+/// is always the first/primary series). See
+/// `libretune_core::ini::CurveYSeries`.
+#[derive(Serialize, Clone)]
+pub struct CurveSeriesData {
+    pub values: Vec<f64>,
+    /// This series' own axis label, if the INI gave it one (`lineLabel`).
+    pub label: Option<String>,
+    /// Result of evaluating the series' `{visibility expression}` against
+    /// the live tune - always `true` when the INI didn't give it one.
+    pub visible: bool,
+}
+
 #[derive(Serialize)]
 pub struct CurveData {
     pub name: String,
@@ -17,6 +30,13 @@ pub struct CurveData {
     pub y_bins: Vec<f64>,
     pub x_label: String,
     pub y_label: String,
+    /// `lineLabel` for the primary series - only meaningful when
+    /// `additional_y_series` is non-empty (a single-series curve's label is
+    /// just `y_label`).
+    pub primary_y_line_label: Option<String>,
+    /// §9.2.1: yBins rows beyond the required first one. Empty for the
+    /// overwhelming majority of curves, which have exactly one Y series.
+    pub additional_y_series: Vec<CurveSeriesData>,
     /// X-axis range: (min, max, step)
     pub x_axis: Option<(f32, f32, f32)>,
     /// Y-axis range: (min, max, step)
@@ -91,11 +111,37 @@ pub async fn get_curve_data(
         .ok_or_else(|| format!("Constant {} not found", curve.y_bins))?
         .clone();
 
+    // §9.2.1: a curve can have any number of yBins beyond the required
+    // first one, each another 1D array with its own optional visibility
+    // expression and lineLabel - rendered as extra color-coded lines on the
+    // same chart (rusEFI's shiftSpeedCurve has 6, rangeMatrix has 11). A
+    // series whose constant is missing from the definition is dropped with
+    // a warning rather than failing the whole curve.
+    let additional_series_sources: Vec<(Constant, Option<String>, Option<String>)> = curve
+        .additional_y_series
+        .iter()
+        .filter_map(|series| {
+            let Some(constant) = def.constants.get(&series.bins) else {
+                eprintln!(
+                    "[WARN] get_curve_data: additional series constant '{}' not found for curve '{}', skipping",
+                    series.bins, curve_name
+                );
+                return None;
+            };
+            Some((
+                constant.clone(),
+                series.visibility_expr.clone(),
+                series.line_label.clone(),
+            ))
+        })
+        .collect();
+
     // Clone curve metadata
     let curve_name_out = curve.name.clone();
     let curve_title = curve.title.clone();
     let x_label = curve.column_labels.0.clone();
     let y_label = curve.column_labels.1.clone();
+    let primary_y_line_label = curve.primary_y_line_label.clone();
     let x_axis_raw = curve.x_axis.clone();
     let y_axis_raw = curve.y_axis.clone();
     let x_output_channel = curve.x_output_channel.clone();
@@ -234,6 +280,12 @@ pub async fn get_curve_data(
     let x_bins = read_const_from_source(&x_const, tune_guard.as_ref(), &mut conn, endianness)?;
     let y_bins = read_const_from_source(&y_const, tune_guard.as_ref(), &mut conn, endianness)?;
 
+    let mut additional_series_values: Vec<(Vec<f64>, Option<String>, Option<String>)> = Vec::new();
+    for (constant, visibility_expr, line_label) in &additional_series_sources {
+        let values = read_const_from_source(constant, tune_guard.as_ref(), &mut conn, endianness)?;
+        additional_series_values.push((values, visibility_expr.clone(), line_label.clone()));
+    }
+
     drop(conn_guard);
     drop(tune_guard);
 
@@ -287,6 +339,24 @@ pub async fn get_curve_data(
     let x_axis = resolve_axis(&x_axis_raw);
     let y_axis = resolve_axis(&y_axis_raw);
 
+    // A series with no {visibility expression} is always shown; one that
+    // fails to evaluate fails open (visible) rather than silently hiding
+    // data the user might need.
+    let additional_y_series: Vec<CurveSeriesData> = additional_series_values
+        .into_iter()
+        .map(|(values, visibility_expr, label)| {
+            let visible = visibility_expr
+                .as_deref()
+                .map(|expr| evaluate_numeric_string(expr, &numeric, Some(&string_ctx)).unwrap_or(1.0) != 0.0)
+                .unwrap_or(true);
+            CurveSeriesData {
+                values,
+                label,
+                visible,
+            }
+        })
+        .collect();
+
     Ok(CurveData {
         name: curve_name_out,
         title: curve_title,
@@ -294,6 +364,8 @@ pub async fn get_curve_data(
         y_bins,
         x_label,
         y_label,
+        primary_y_line_label,
+        additional_y_series,
         x_axis,
         y_axis,
         x_output_channel,

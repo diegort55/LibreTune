@@ -83,6 +83,10 @@ export interface CurveData {
   /** See `x_bins_read_only`. */
   y_bins_read_only?: boolean;
   gauge?: string | null;
+  /** `lineLabel` matched to the primary `y_bins` series when the curve has more than one (§9.2.1). */
+  primary_y_line_label?: string | null;
+  /** Extra reference lines beyond the primary `y_bins` series - read-only here, same X bins. */
+  additional_y_series?: Array<{ values: number[]; label?: string | null; visible: boolean }>;
 }
 
 export interface FieldInfo {

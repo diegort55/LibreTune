@@ -1796,12 +1796,55 @@ fn parse_curve_editor_entry(
                 }
                 "ybins" => {
                     // Format: yBins = valueVariable[, outputChannel][, readOnly]
+                    // §9.2.1: "One yBins row is required, but multiples can
+                    // be used by adding additional rows with other 1D array
+                    // references" - each with an optional
+                    // {visibility expression}, rendered as extra color-coded
+                    // lines on the same chart (rusEFI's shiftSpeedCurve has
+                    // 6, rangeMatrix has 11). The first row is the primary
+                    // series (y_bins, unchanged from before); every row
+                    // after that used to silently overwrite y_bins, keeping
+                    // only the last series and dropping the rest.
                     let parts = split_ini_line(value);
                     if !parts.is_empty() {
-                        curve.y_bins = parts[0].trim().to_string();
-                        curve.y_bins_read_only = parts[1..]
-                            .iter()
-                            .any(|p| p.trim().eq_ignore_ascii_case("readonly"));
+                        let bins_name = parts[0].trim().to_string();
+                        if curve.y_bins.is_empty() {
+                            curve.y_bins = bins_name;
+                            curve.y_bins_read_only = parts[1..]
+                                .iter()
+                                .any(|p| p.trim().eq_ignore_ascii_case("readonly"));
+                        } else {
+                            let visibility_expr = parts[1..]
+                                .iter()
+                                .map(|p| p.trim())
+                                .find(|p| p.starts_with('{') && p.ends_with('}'))
+                                .map(|p| p.to_string());
+                            curve.additional_y_series.push(super::tables::CurveYSeries {
+                                bins: bins_name,
+                                visibility_expr,
+                                line_label: None,
+                            });
+                        }
+                    }
+                }
+                "linelabel" => {
+                    // Format: lineLabel = "Label" - one per y series, applied
+                    // positionally in parse order (primary first, then each
+                    // additional series in the order its yBins was added).
+                    // rusEFI writes every yBins row first and every lineLabel
+                    // row after for some curves (rangeMatrix), interleaved
+                    // for others (shiftSpeedCurve) - matching "whichever
+                    // series doesn't have a label yet, in order" handles
+                    // both without caring which pattern this INI used.
+                    let label = value.trim().trim_matches('"').to_string();
+                    if curve.primary_y_line_label.is_none() && !curve.y_bins.is_empty() {
+                        curve.primary_y_line_label = Some(label);
+                    } else if let Some(series) = curve
+                        .additional_y_series
+                        .iter_mut()
+                        .find(|s| s.line_label.is_none())
+                    {
+                        series.line_label = Some(label);
                     }
                 }
                 "size" => {
@@ -3441,6 +3484,125 @@ zBins = veTable1
         let table = def.tables.get("veTable1Tbl").expect("table parsed");
         assert!(!table.x_bins_read_only);
         assert!(!table.y_bins_read_only);
+    }
+
+    /// rusEFI's `shiftSpeedCurve` (6 series): every `yBins` line immediately
+    /// followed by its own `lineLabel` line, in the same order. Before this,
+    /// every `yBins` after the first silently overwrote `curve.y_bins`, so
+    /// only "tcu_shiftSpeed43" (the last of the 6) survived parsing - the
+    /// other 5 gear-shift curves vanished with no error.
+    #[test]
+    fn curve_multi_series_interleaved_ybins_and_linelabel() {
+        let ini = "[CurveEditor]
+curve = shiftSpeedCurve, \"Automatic Shift Points\"
+columnLabel = \"Throttle\", \"\"
+xBins = tcu_shiftTpsBins, TPSValue
+yBins = tcu_shiftSpeed12
+yBins = tcu_shiftSpeed23
+yBins = tcu_shiftSpeed34
+yBins = tcu_shiftSpeed21
+yBins = tcu_shiftSpeed32
+yBins = tcu_shiftSpeed43
+lineLabel = \"1->2\"
+lineLabel = \"2->3\"
+lineLabel = \"3->4\"
+lineLabel = \"2->1\"
+lineLabel = \"3->2\"
+lineLabel = \"4->3\"
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("shiftSpeedCurve").expect("curve parsed");
+        assert_eq!(curve.y_bins, "tcu_shiftSpeed12", "first yBins is primary");
+        assert_eq!(curve.primary_y_line_label, Some("1->2".to_string()));
+        assert_eq!(curve.additional_y_series.len(), 5, "the other 5 series must not be dropped");
+        let bins: Vec<&str> = curve
+            .additional_y_series
+            .iter()
+            .map(|s| s.bins.as_str())
+            .collect();
+        assert_eq!(
+            bins,
+            vec![
+                "tcu_shiftSpeed23",
+                "tcu_shiftSpeed34",
+                "tcu_shiftSpeed21",
+                "tcu_shiftSpeed32",
+                "tcu_shiftSpeed43",
+            ]
+        );
+        let labels: Vec<Option<&str>> = curve
+            .additional_y_series
+            .iter()
+            .map(|s| s.line_label.as_deref())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![Some("2->3"), Some("3->4"), Some("2->1"), Some("3->2"), Some("4->3")]
+        );
+    }
+
+    /// rusEFI's `rangeMatrix` (11 series): every `yBins` line written first,
+    /// every `lineLabel` line after, in matching order - not interleaved
+    /// like `shiftSpeedCurve`. Labels are matched positionally (first
+    /// label-less series gets the next label), so this pattern works too.
+    #[test]
+    fn curve_multi_series_grouped_ybins_then_linelabels() {
+        let ini = "[CurveEditor]
+curve = rangeMatrix, \"Range Switch Input Matrix\"
+columnLabel = \"Pin\", \"\"
+xBins = rangeInputArray
+yBins = tcu_rangeP
+yBins = tcu_rangeR
+yBins = tcu_rangeN
+lineLabel = \"Park\"
+lineLabel = \"Reverse\"
+lineLabel = \"Neutral\"
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("rangeMatrix").expect("curve parsed");
+        assert_eq!(curve.y_bins, "tcu_rangeP");
+        assert_eq!(curve.primary_y_line_label, Some("Park".to_string()));
+        assert_eq!(curve.additional_y_series.len(), 2);
+        assert_eq!(curve.additional_y_series[0].bins, "tcu_rangeR");
+        assert_eq!(curve.additional_y_series[0].line_label, Some("Reverse".to_string()));
+        assert_eq!(curve.additional_y_series[1].bins, "tcu_rangeN");
+        assert_eq!(curve.additional_y_series[1].line_label, Some("Neutral".to_string()));
+    }
+
+    /// §9.2.1: "an expression parameter can be appended that evaluates to
+    /// whether that y array is active or not" - not used anywhere in
+    /// rusEFI's real INI, but still spec-valid syntax to preserve.
+    #[test]
+    fn curve_multi_series_visibility_expression_is_captured() {
+        let ini = "[CurveEditor]
+curve = icfCurve, \"Ignition Cut Fire\"
+xBins = icfXBins
+yBins = ICF_Table_a
+yBins = ICF_Table_b, { engType == 0 ? Fire_Order_b <= cylCount / 2 : Fire_Order_b % 2 == 1 }
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("icfCurve").expect("curve parsed");
+        assert_eq!(curve.additional_y_series.len(), 1);
+        assert_eq!(
+            curve.additional_y_series[0].visibility_expr,
+            Some("{ engType == 0 ? Fire_Order_b <= cylCount / 2 : Fire_Order_b % 2 == 1 }".to_string())
+        );
+    }
+
+    /// A single-series curve (the overwhelming majority) must behave exactly
+    /// as before: one yBins, no additional series.
+    #[test]
+    fn curve_single_series_unaffected() {
+        let ini = "[CurveEditor]
+curve = tchargeCurve, \"Charge temperature estimation coefficient\"
+xBins = tchargeBins, mafEstimate
+yBins = tchargeValues
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("tchargeCurve").expect("curve parsed");
+        assert_eq!(curve.y_bins, "tchargeValues");
+        assert!(curve.additional_y_series.is_empty());
+        assert!(curve.primary_y_line_label.is_none());
     }
 
     /// An INI picks metric units with `#if CELSIUS`. TunerStudio defines that
