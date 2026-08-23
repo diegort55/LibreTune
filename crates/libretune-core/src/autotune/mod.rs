@@ -128,7 +128,12 @@ impl Default for AutoTuneFilters {
             max_y_axis: None,
             min_clt: 160.0,
             custom_filter: None,
-            max_tps_rate: 10.0,         // 10%/sec threshold
+            // 50 %/s: brisk-but-deliberate throttle use. The old 10 %/s
+            // default rejected nearly everything on individual-throttle-body
+            // (Alpha-N) engines, whose throttles snap far faster than a
+            // single-plenum setup — AutoTune looked dead (issue #132). Genuine
+            // accel transients are still caught by `exclude_accel_enrich`.
+            max_tps_rate: 50.0,
             exclude_accel_enrich: true, // Exclude accel enrichment by default
         }
     }
@@ -166,6 +171,12 @@ pub struct AutoTuneState {
     // Total number of samples that passed filters (denominator for
     // hit_percentage). See bug #16.
     total_samples: u64,
+    // Per-reason counts of samples rejected by the filters. Surface these in
+    // the UI (issue #132): a session that accepts nothing looks exactly like
+    // a broken one, and the counts say which filter is eating the data
+    // (a warm-up CLT below min_clt and a tip-in TPS rate above max_tps_rate
+    // are the usual culprits).
+    rejected_by_reason: HashMap<&'static str, u64>,
 }
 
 impl Default for AutoTuneState {
@@ -179,9 +190,17 @@ impl Default for AutoTuneState {
             reference_tables: AutoTuneReferenceTables::default(),
             strict_lambda_match: true, // Safe default: drop unmatched samples
             total_samples: 0,
+            rejected_by_reason: HashMap::new(),
         }
     }
 }
+
+/// Wideband readings outside this range are the sensor at a stop rather than
+/// a mixture: no running engine sustains them, and a railed reading carries no
+/// information about the VE table. Deliberately wider than any tuning target
+/// so a genuinely rich or lean cell is still analysed.
+pub const AFR_RAIL_LOW: f64 = 10.0;
+pub const AFR_RAIL_HIGH: f64 = 19.5;
 
 /// Data point from ECU for VE analysis
 #[derive(Debug, Clone)]
@@ -197,6 +216,12 @@ pub struct VEDataPoint {
     pub tps: f64,                          // Current TPS value (%)
     pub tps_rate: f64,                     // TPS change rate (%/sec)
     pub accel_enrich_active: Option<bool>, // ECU accel enrichment flag (if available)
+    /// ECU overrun fuel-cut flag (DFCO), when the INI exposes one.
+    ///
+    /// During a cut the injectors are off, so the wideband reads full lean and
+    /// the mixture says nothing about the VE table. `None` means the channel
+    /// was not found; the AFR-rail check below still catches most of it.
+    pub fuel_cut_active: Option<bool>,
     // Lambda delay correlation
     pub timestamp_ms: u64, // Timestamp for delay correlation
 }
@@ -208,12 +233,17 @@ impl Default for VEDataPoint {
             map: 0.0,
             maf: 0.0,
             load: 0.0,
-            afr: 0.0,
+            // Stoich, not 0.0: a default point should be a VALID one. Zero
+            // AFR is physically impossible and now trips the sensor-rail
+            // check, which would make every default-constructed point fail
+            // filtering for a reason that has nothing to do with the test.
+            afr: 14.7,
             ve: 0.0,
             clt: 0.0,
             tps: 0.0,
             tps_rate: 0.0,
             accel_enrich_active: None,
+            fuel_cut_active: None,
             timestamp_ms: 0,
         }
     }
@@ -229,6 +259,7 @@ impl AutoTuneState {
         self.recommendations.clear();
         self.data_buffer.clear();
         self.total_samples = 0;
+        self.rejected_by_reason.clear();
     }
 
     pub fn stop(&mut self) {
@@ -360,7 +391,34 @@ impl AutoTuneState {
         }
     }
 
-    /// Find the data point from the buffer that best matches the lambda delay
+    /// Mean spacing between buffered samples, in milliseconds.
+    ///
+    /// The stream's real cadence, not the configured one: single-shot reads
+    /// contend with the realtime poll for the connection lock and land at
+    /// 5-9 Hz on hardware, against a nominal 20 Hz.
+    fn mean_sample_gap_ms(&self) -> Option<u64> {
+        let n = self.data_buffer.len();
+        if n < 2 {
+            return None;
+        }
+        let first = self.data_buffer.front()?.timestamp_ms;
+        let last = self.data_buffer.back()?.timestamp_ms;
+        last.checked_sub(first).map(|span| span / (n as u64 - 1))
+    }
+
+    /// Find the data point from the buffer that best matches the lambda delay.
+    ///
+    /// The match tolerance follows the stream's actual sample spacing instead
+    /// of a fixed 50 ms. With samples every T ms the nearest one to any target
+    /// inside the buffer is at most T/2 away, so a fixed 50 ms window rejects
+    /// good matches as soon as T exceeds ~100 ms — and on this hardware T is
+    /// 111-200 ms, so roughly a third to a half of all samples were dropped
+    /// with nothing to show for it but a throttled debug line. That is the
+    /// "AutoTune runs but recommendations never accumulate" symptom.
+    ///
+    /// Scaling to the cadence keeps the check meaningful: a genuine gap in the
+    /// buffer (a dropout, or a delay reaching past the buffered history) is
+    /// still far larger than a sample interval and still rejected.
     fn find_delayed_data_point(
         &self,
         current_timestamp_ms: u64,
@@ -381,8 +439,14 @@ impl AutoTuneState {
             }
         }
 
-        // Only use if within 50ms of target time
-        if best_diff < 50 {
+        // Half a sample interval is the best any evenly-spaced stream can do;
+        // allow a little over that for jitter, and never tighten below the
+        // historical 50 ms for fast streams.
+        let tolerance = self
+            .mean_sample_gap_ms()
+            .map(|gap| (gap * 6 / 10).max(50))
+            .unwrap_or(50);
+        if best_diff <= tolerance {
             best_match.cloned()
         } else {
             None
@@ -394,6 +458,20 @@ impl AutoTuneState {
     /// (e.g. logging how much data a session actually accepted).
     pub fn total_samples(&self) -> u64 {
         self.total_samples
+    }
+
+    /// Per-reason counts of filter-rejected samples this session, most
+    /// frequent first. Empty when nothing has been rejected. Lets the UI say
+    /// *why* a session is not accumulating data instead of looking dead
+    /// (issue #132).
+    pub fn rejection_counts(&self) -> Vec<(&'static str, u64)> {
+        let mut counts: Vec<(&'static str, u64)> = self
+            .rejected_by_reason
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        counts
     }
 
     /// Which filter rejected a sample, for the diagnostic log. Mirrors the
@@ -411,6 +489,12 @@ impl AutoTuneState {
         }
         if bound(&filters.max_y_axis).is_some_and(|b| point.load > b) {
             return "load above max_y_axis";
+        }
+        if point.fuel_cut_active == Some(true) {
+            return "overrun fuel cut";
+        }
+        if !(AFR_RAIL_LOW..=AFR_RAIL_HIGH).contains(&point.afr) {
+            return "afr at sensor rail";
         }
         if point.tps_rate.abs() > filters.max_tps_rate {
             return "tps_rate above max_tps_rate";
@@ -447,6 +531,10 @@ impl AutoTuneState {
         self.prune_data_buffer(point.timestamp_ms);
 
         if !self.passes_filters(&point, filters) {
+            // Count per reason for the UI's rejection indicator (issue #132):
+            // a session that accepts nothing looks exactly like a broken one.
+            let reason = Self::rejection_reason(&point, filters);
+            *self.rejected_by_reason.entry(reason).or_insert(0) += 1;
             // Throttled so a full drive doesn't flood the log, but enough to
             // show *why* AutoTune "does nothing": compare these against the
             // active filter thresholds (a warm-up CLT below min_clt and a
@@ -459,7 +547,7 @@ impl AutoTuneState {
                 // enrichment showed every printed value passing while samples
                 // still vanished — an hour of misdiagnosis on real hardware.
                 tracing::debug!(
-                    reason = Self::rejection_reason(&point, filters),
+                    reason = reason,
                     rpm = point.rpm,
                     clt = point.clt,
                     load = point.load,
@@ -739,6 +827,24 @@ impl AutoTuneState {
             }
         }
 
+        // Overrun fuel cut: injectors off, so the wideband reads full lean and
+        // the reading carries no VE information. Left in, these samples land in
+        // exactly the low-load cells the car passes through on every lift, and
+        // each one asks for the maximum enrichment the authority limit allows —
+        // a required-VE of ve * (21/14.7) is +43%, clamped to +20%, over and
+        // over. TunerStudio's VE Analyze excludes overrun for the same reason.
+        if point.fuel_cut_active == Some(true) {
+            return false;
+        }
+
+        // A railed wideband is not a measurement. Below ~10 or above ~19.5 AFR
+        // no engine is running a real mixture: it is the sensor at a stop, an
+        // unpowered heater, or a cut still washing out. Catches the fuel-cut
+        // case too when the ECU exposes no DFCO channel.
+        if !(AFR_RAIL_LOW..=AFR_RAIL_HIGH).contains(&point.afr) {
+            return false;
+        }
+
         // Transient filtering: reject if TPS is changing too fast
         if point.tps_rate.abs() > filters.max_tps_rate {
             return false;
@@ -869,10 +975,126 @@ mod tests {
     use super::*;
 
     /// The accel-enrich filter must only reject when the flag is known-true.
+    /// During overrun the injectors are off: the wideband reads full lean
+    /// while rpm, load, CLT and a steady closed throttle all pass. Left in,
+    /// each such sample asks for the authority-limit maximum enrichment in
+    /// exactly the low-load cells the car crosses on every lift.
+    #[test]
+    fn fuel_cut_samples_are_rejected() {
+        let state = AutoTuneState::default();
+        let filters = AutoTuneFilters {
+            min_rpm: 0.0,
+            min_clt: -100.0,
+            max_tps_rate: 1000.0,
+            ..Default::default()
+        };
+        let mut point = VEDataPoint::default();
+        point.rpm = 2500.0;
+        point.clt = 80.0;
+        point.afr = 14.7;
+
+        point.fuel_cut_active = Some(true);
+        assert!(!state.passes_filters(&point, &filters), "a cut must reject");
+        assert_eq!(
+            AutoTuneState::rejection_reason(&point, &filters),
+            "overrun fuel cut"
+        );
+
+        point.fuel_cut_active = Some(false);
+        assert!(state.passes_filters(&point, &filters), "not cutting passes");
+
+        point.fuel_cut_active = None;
+        assert!(
+            state.passes_filters(&point, &filters),
+            "unknown must pass — many INIs expose no DFCO channel"
+        );
+    }
+
+    /// A railed sensor is not a mixture. This also covers the fuel-cut case on
+    /// ECUs that expose no DFCO channel at all.
+    #[test]
+    fn railed_wideband_readings_are_rejected() {
+        let state = AutoTuneState::default();
+        let filters = AutoTuneFilters {
+            min_rpm: 0.0,
+            min_clt: -100.0,
+            max_tps_rate: 1000.0,
+            ..Default::default()
+        };
+        let mut point = VEDataPoint::default();
+        point.rpm = 2500.0;
+        point.clt = 80.0;
+
+        for railed in [9.9, 10.0 - 0.01, 19.6, 22.0, 0.0] {
+            point.afr = railed;
+            assert!(
+                !state.passes_filters(&point, &filters),
+                "{railed} AFR is a rail, not a measurement"
+            );
+        }
+        for real in [11.5, 12.7, 14.7, 16.0, 19.4] {
+            point.afr = real;
+            assert!(
+                state.passes_filters(&point, &filters),
+                "{real} AFR is a usable mixture"
+            );
+        }
+    }
+
+    /// The match window must follow the stream's real cadence. At the 111-200
+    /// ms spacing single-shot reads actually achieve, a fixed 50 ms window
+    /// rejects samples that are as close as an evenly-spaced stream can ever
+    /// get — half an interval — which silently discarded a third to a half of
+    /// every session.
+    #[test]
+    fn delayed_match_tolerates_the_streams_real_sample_spacing() {
+        let mut state = AutoTuneState::default();
+        state.buffer_max_age_ms = 5_000;
+        // 150 ms spacing: the nearest sample to any target is up to 75 ms away,
+        // which the old fixed 50 ms window rejected outright.
+        for i in 0..20u64 {
+            let mut p = VEDataPoint::default();
+            p.timestamp_ms = i * 150;
+            p.rpm = 2000.0;
+            state.data_buffer.push_back(p);
+        }
+        assert_eq!(state.mean_sample_gap_ms(), Some(150));
+
+        // Worst case for evenly-spaced sampling: a target exactly BETWEEN two
+        // samples, 75 ms from each. No stream at this cadence can ever do
+        // better, yet the old fixed 50 ms window rejected it. Delay 975 ms
+        // from the newest sample (t=2850) targets t=1875, midway between the
+        // samples at 1800 and 1950.
+        assert!(
+            state.find_delayed_data_point(2850, 975).is_some(),
+            "a target midway between samples is the best this cadence can do              and must match"
+        );
+
+        // A genuine hole is still rejected. Rebuild the buffer with a dropout
+        // in the middle and aim at it: the nearest sample is then many
+        // intervals away, not half of one.
+        state.data_buffer.clear();
+        for t in (0..900u64).step_by(150).chain((2400..2900u64).step_by(150)) {
+            let mut p = VEDataPoint::default();
+            p.timestamp_ms = t;
+            p.rpm = 2000.0;
+            state.data_buffer.push_back(p);
+        }
+        // Target t=1650, sitting inside the 750-2400 ms dropout.
+        assert!(
+            state.find_delayed_data_point(2850, 1200).is_none(),
+            "a target inside a dropout must not match"
+        );
+    }
+
+    /// The accel-enrich filter must only reject when the flag is known-true.
     /// An unknown flag (None — e.g. an ECU that publishes no boolean AE
     /// channel) must not reject: treating unknown as active silently discarded
     /// 100% of samples on Speeduino, whose `accelEnrich` channel is a
     /// percentage (100 = no enrichment) and was misread as a boolean.
+    /// (The `#[test]` for this function was previously stranded on the wrong
+    /// doc comment above `fuel_cut_samples_are_rejected`, so this test never
+    /// ran.)
     #[test]
     fn accel_filter_rejects_only_known_active() {
         let state = AutoTuneState::default();
@@ -928,11 +1150,99 @@ mod tests {
         );
 
         point.clt = 180.0;
-        point.tps_rate = 50.0;
+        point.tps_rate = 80.0;
         assert_eq!(
             AutoTuneState::rejection_reason(&point, &filters),
             "tps_rate above max_tps_rate"
         );
+    }
+
+    /// The default transient threshold must stay ITB-friendly: the old
+    /// 10 %/s rejected nearly every sample on individual-throttle-body
+    /// (Alpha-N) engines, whose throttles snap far faster than a
+    /// single-plenum setup — AutoTune looked dead (issue #132). A point at
+    /// 50 %/s (deliberate-but-brisk throttle use) must pass by default.
+    #[test]
+    fn default_tps_rate_is_itb_friendly() {
+        assert_eq!(AutoTuneFilters::default().max_tps_rate, 50.0);
+
+        let mut point = VEDataPoint::default();
+        point.rpm = 2000.0;
+        point.clt = 180.0;
+        point.tps_rate = 50.0;
+        assert!(
+            AutoTuneState::default().passes_filters(&point, &AutoTuneFilters::default()),
+            "50 %/s throttle movement must not be rejected by default"
+        );
+    }
+
+    /// Rejected samples must be counted per reason so the UI can say *why* a
+    /// session is not accumulating data instead of looking dead (issue #132).
+    #[test]
+    fn rejected_samples_are_counted_per_reason() {
+        let mut state = AutoTuneState::default();
+        state.start();
+
+        let filters = AutoTuneFilters {
+            min_rpm: 1000.0,
+            min_clt: 160.0,
+            max_tps_rate: 50.0,
+            ..Default::default()
+        };
+
+        let mut cold = VEDataPoint::default();
+        cold.rpm = 2000.0;
+        cold.clt = 100.0; // below min_clt
+
+        let mut fast_throttle = VEDataPoint::default();
+        fast_throttle.rpm = 2000.0;
+        fast_throttle.clt = 180.0;
+        fast_throttle.tps_rate = 80.0; // above max_tps_rate
+
+        let mut good = VEDataPoint::default();
+        good.rpm = 2000.0;
+        good.clt = 180.0;
+        good.afr = 14.7;
+        good.ve = 50.0;
+
+        // Bins for a 1-cell table; attribution is not what's under test.
+        let bins_x = [1000.0];
+        let bins_y = [50.0];
+        let settings = AutoTuneSettings::default();
+        let authority = AutoTuneAuthorityLimits::default();
+
+        state.add_data_point(
+            cold.clone(),
+            &bins_x,
+            &bins_y,
+            &settings,
+            &filters,
+            &authority,
+        );
+        state.add_data_point(cold, &bins_x, &bins_y, &settings, &filters, &authority);
+        state.add_data_point(
+            fast_throttle,
+            &bins_x,
+            &bins_y,
+            &settings,
+            &filters,
+            &authority,
+        );
+        state.add_data_point(good, &bins_x, &bins_y, &settings, &filters, &authority);
+
+        let counts = state.rejection_counts();
+        assert_eq!(
+            counts[0],
+            ("clt below min_clt", 2),
+            "sorted most frequent first"
+        );
+        assert_eq!(counts[1], ("tps_rate above max_tps_rate", 1));
+        assert_eq!(state.total_samples(), 1, "accepted sample is counted too");
+
+        // Restarting the session clears the tallies.
+        state.start();
+        assert!(state.rejection_counts().is_empty());
+        assert_eq!(state.total_samples(), 0);
     }
 
     /// Captures `tracing` event messages into a shared Vec so a test can assert

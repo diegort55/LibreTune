@@ -3304,6 +3304,7 @@ fn parse_constants_extensions_entry(def: &mut EcuDefinition, key: &str, value: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// A curve's `columnLabel` can itself be a braced expression with a
     /// comma of its own (rusEFI's real INI does this for every blend
@@ -3446,8 +3447,13 @@ zBins = veTable1
     /// from the project's `ecuSettings`; nothing carried it into LibreTune, so
     /// the Fahrenheit `#else` arm always won and a 23 degC cold start read 73
     /// on the gauge under a generic "TEMP" label.
+    ///
+    /// Serialized against [`a_definition_remembers_the_symbols_it_was_parsed_with`]:
+    /// both tests toggle the process-wide `DEFAULT_SYMBOLS` seed, and cargo
+    /// runs tests in parallel by default, so without this they can interleave
+    /// and flip each other's seed between `set_default_symbols` and `parse_ini`.
     #[test]
-    #[serial_test::serial(default_symbols)]
+    #[serial(default_symbols)]
     fn celsius_symbol_selects_the_metric_branch() {
         let ini = concat!(
             "[Constants]
@@ -3496,7 +3502,7 @@ zBins = veTable1
     /// plausible. Keeping the answer on the definition also means this holds
     /// with other parses running concurrently.
     #[test]
-    #[serial_test::serial(default_symbols)]
+    #[serial(default_symbols)]
     fn a_definition_remembers_the_symbols_it_was_parsed_with() {
         let ini = "[Constants]
 page = 1
