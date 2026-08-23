@@ -6,6 +6,18 @@ use super::split_ini_line;
 use super::types::{DataType, DynamicSizeRefs, Endianness, Shape};
 use serde::{Deserialize, Serialize};
 
+/// Which OutputChannel a §5.1 "specialized PcVariable" tracks, and when -
+/// `pcVariableName = channelValueOnConnect, chan` / `= continuousChannelValue,
+/// chan`. Distinct from a plain PcVariable: its value comes from an
+/// OutputChannel rather than direct user entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelTrackingMode {
+    /// Captured once when a controller connection is made.
+    OnConnect,
+    /// Kept in sync with the channel for the whole communication session.
+    Continuous,
+}
+
 /// A constant/parameter definition from the INI file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Constant {
@@ -90,6 +102,29 @@ pub struct Constant {
     /// Same as [`Constant::scale_expr`], for the translate field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translate_expr: Option<String>,
+
+    /// `noMsqSave` last-attribute (or `[ConstantExtensions] noMsqSave = name`):
+    /// never load this constant's value from a calibration/MSQ file - it
+    /// always starts from its default/live value instead.
+    #[serde(default)]
+    pub no_msq_save: bool,
+
+    /// `controllerPriority` last-attribute (or `[ConstantExtensions]
+    /// controllerPriority = name`): can be saved/loaded offline, but a live
+    /// controller's value always silently wins over any stored one once
+    /// connected - e.g. a learned table like Long Term Fuel Trim, where a
+    /// saved tune's copy is stale the moment the ECU is running.
+    #[serde(default)]
+    pub controller_priority: bool,
+
+    /// Present for §5.1 specialized PcVariables (`pcVariableName =
+    /// channelValueOnConnect, chan` / `= continuousChannelValue, chan`):
+    /// which OutputChannel this PcVariable mirrors, and how often. Before
+    /// this was recognized, `DataType::from_ini_str` was handed the channel
+    /// name in place of a type keyword, failed, and the whole line was
+    /// dropped - the PcVariable never existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks_output_channel: Option<(String, ChannelTrackingMode)>,
 }
 
 /// Extract a deferred expression from an INI numeric field.
@@ -132,6 +167,9 @@ impl Constant {
             dynamic_size: None,
             scale_expr: None,
             translate_expr: None,
+            no_msq_save: false,
+            controller_priority: false,
+            tracks_output_channel: None,
         }
     }
 
@@ -190,6 +228,9 @@ impl Default for Constant {
             dynamic_size: None,
             scale_expr: None,
             translate_expr: None,
+            no_msq_save: false,
+            controller_priority: false,
+            tracks_output_channel: None,
         }
     }
 }
@@ -247,14 +288,36 @@ pub fn parse_constant_line(
                 constant.display_offset = display_offset;
             }
         }
-        // Collect bit options (everything after the bit spec)
-        // These are the labels for each possible value (e.g., "Off", "On")
+        // Collect bit options (everything after the bit spec) - the labels
+        // for each possible value (e.g., "Off", "On"). Each token is either
+        // a plain "Label" (goes at the next sequential index) or the
+        // shorthand `N="Label"` (places it at bit-value N and resumes
+        // sequential numbering from N+1), used for long option lists with
+        // gaps instead of writing out every "INVALID" filler by hand -
+        // e.g. rusEFI's `engineType` selector: `22="BMW_M52"`.
+        let mut next_index: usize = 0;
         for part in parts.iter().skip(4) {
-            let opt = part.trim().trim_matches('"').to_string();
-            if !opt.is_empty() && !opt.starts_with('{') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() || trimmed.starts_with('{') {
                 // Skip empty options and visibility conditions
-                constant.bit_options.push(opt);
+                continue;
             }
+            let (index, label) = match trimmed.split_once('=') {
+                Some((index_str, label_part)) if index_str.trim().parse::<usize>().is_ok() => (
+                    index_str.trim().parse::<usize>().unwrap(),
+                    label_part.trim().trim_matches('"').to_string(),
+                ),
+                _ => (next_index, trimmed.trim_matches('"').to_string()),
+            };
+            while constant.bit_options.len() < index {
+                constant.bit_options.push("INVALID".to_string());
+            }
+            if constant.bit_options.len() == index {
+                constant.bit_options.push(label);
+            } else {
+                constant.bit_options[index] = label;
+            }
+            next_index = index + 1;
         }
         return Some(constant);
     } else if class == "array" && parts.len() > 3 {
@@ -301,6 +364,7 @@ pub fn parse_constant_line(
     if parts.len() > scale_idx + 4 {
         constant.digits = parts[scale_idx + 4].parse().unwrap_or(0);
     }
+    apply_last_attribute_keywords(&mut constant, &parts[(scale_idx + 5).min(parts.len())..]);
 
     Some(constant)
 }
@@ -323,6 +387,27 @@ pub fn parse_pc_variable_line(name: &str, value: &str, help: Option<String>) -> 
     // NO offset for PcVariables
 
     let class = parts[0].to_lowercase();
+
+    // §5.1 specialized PcVariables: `pcVariableName = channelValueOnConnect,
+    // referencedOutputChannel` / `= continuousChannelValue, referencedOutputChannel`.
+    // parts[1] here is the tracked channel's *name*, not a DataType keyword -
+    // falling through to `DataType::from_ini_str(parts[1])?` below would
+    // always fail on it and drop the whole PcVariable.
+    if class == "channelvalueonconnect" || class == "continuouschannelvalue" {
+        let mut constant = Constant::new(name, 255, 0, DataType::F32);
+        constant.is_pc_variable = true;
+        constant.help = help;
+        if let Some(channel) = parts.get(1) {
+            let mode = if class == "continuouschannelvalue" {
+                ChannelTrackingMode::Continuous
+            } else {
+                ChannelTrackingMode::OnConnect
+            };
+            constant.tracks_output_channel = Some((channel.trim().to_string(), mode));
+        }
+        return Some(constant);
+    }
+
     let data_type = DataType::from_ini_str(parts[1])?;
 
     // Use page 255 to indicate PC variable (not stored on ECU)
@@ -373,6 +458,7 @@ pub fn parse_pc_variable_line(name: &str, value: &str, help: Option<String>) -> 
         if parts.len() > 8 {
             constant.digits = parts[8].parse().unwrap_or(0);
         }
+        apply_last_attribute_keywords(&mut constant, &parts[9.min(parts.len())..]);
         return Some(constant);
     }
 
@@ -395,8 +481,24 @@ pub fn parse_pc_variable_line(name: &str, value: &str, help: Option<String>) -> 
     if parts.len() > 7 {
         constant.digits = parts[7].parse().unwrap_or(0);
     }
+    apply_last_attribute_keywords(&mut constant, &parts[8.min(parts.len())..]);
 
     Some(constant)
+}
+
+/// §4.5 last-attribute keywords appended after `digits` on a Constant or
+/// PcVariable line (or `[ConstantExtensions] noMsqSave = name` / `=
+/// controllerPriority = name`, applied separately - see
+/// `parse_constants_extensions_entry`).
+fn apply_last_attribute_keywords(constant: &mut Constant, trailing: &[&str]) {
+    for part in trailing {
+        let trimmed = part.trim();
+        if trimmed.eq_ignore_ascii_case("noMsqSave") {
+            constant.no_msq_save = true;
+        } else if trimmed.eq_ignore_ascii_case("controllerPriority") {
+            constant.controller_priority = true;
+        }
+    }
 }
 
 /// Parse TunerStudio bit range `[start:end]` or `[start:end+N]` / `[start:end-N]`.
@@ -608,5 +710,118 @@ mod tests {
         assert_eq!(c.bit_options[1], "INVALID");
         assert_eq!(c.bit_options[2], "INVALID");
         assert_eq!(c.bit_options[3], "Advanced");
+    }
+
+    /// rusEFI's `engineType` selector (the board/engine picker, one of the
+    /// most central fields in the INI) uses this shorthand for its ~105
+    /// sparse options rather than writing out every "INVALID" filler by
+    /// hand: `22="BMW_M52"`. The old parser only trim_matches('"') on each
+    /// token - which does nothing at the *start* of `22="BMW_M52"` since it
+    /// doesn't begin with a quote - so it pushed the literal garbage
+    /// `22="BMW_M52` at the next sequential slot instead of "BMW_M52" at
+    /// index 22, corrupting every option's index from that point on.
+    #[test]
+    fn test_parse_bits_with_indexed_option_shorthand() {
+        let c = parse_constant_line(
+            "engineType",
+            "bits, U32, 0, [0:6], 1=\"Option 1\", 3=\"Option 2\"",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(
+            c.bit_options,
+            vec!["INVALID", "Option 1", "INVALID", "Option 2"]
+        );
+    }
+
+    /// Sequential numbering resumes after an explicit index, matching the
+    /// spec's stated equivalence for `1="Option 1", 3="Option 2"`.
+    #[test]
+    fn test_parse_bits_indexed_shorthand_resumes_sequential_numbering() {
+        let c = parse_constant_line(
+            "mixedOptions",
+            "bits, U08, 0, [0:2], \"Zero\", 5=\"Five\", \"Six\"",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(
+            c.bit_options,
+            vec!["Zero", "INVALID", "INVALID", "INVALID", "INVALID", "Five", "Six"]
+        );
+    }
+
+    /// rusEFI's real INI: Long Term Fuel Trim is a *learned* table the ECU
+    /// updates live, so its INI entry marks both flags -
+    /// `noMsqSave,controllerPriority` (§4.5) - meaning a saved tune's copy
+    /// is never trusted: never loaded from a calibration file, and any
+    /// online value always silently wins. Neither flag was parsed at all.
+    #[test]
+    fn test_parse_last_attribute_keywords_no_msq_save_and_controller_priority() {
+        let c = parse_constant_line(
+            "ltft_table_bank1",
+            "array, F32, 0, [16x16], \"%\", 100.0, 0.00000, -35.0, 35.0, 1, noMsqSave,controllerPriority",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert!(c.no_msq_save);
+        assert!(c.controller_priority);
+    }
+
+    /// A constant without either trailing keyword must not have them
+    /// inferred - both stay false.
+    #[test]
+    fn test_parse_last_attribute_keywords_absent_by_default() {
+        let c = parse_constant_line("plainConst", "scalar, U08, 10, \"\", 1, 0, 0, 255, 0", 0, 0, None);
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert!(!c.no_msq_save);
+        assert!(!c.controller_priority);
+    }
+
+    /// PcVariables carry the same trailing keywords - rusEFI's real
+    /// `veLoadSrc = scalar, U08, "", 1, 0, 0, 5, 0, noMsqSave`.
+    #[test]
+    fn test_parse_pc_variable_no_msq_save() {
+        let c = parse_pc_variable_line("veLoadSrc", "scalar, U08, \"\", 1, 0, 0, 5, 0, noMsqSave", None);
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert!(c.no_msq_save);
+        assert!(!c.controller_priority);
+    }
+
+    /// rusEFI's real INI: `tuneCrcPcVariable = continuousChannelValue,
+    /// tuneCrc16`. Before this, `DataType::from_ini_str("tuneCrc16")` failed
+    /// (it's a channel name, not a type keyword) and the whole PcVariable
+    /// was silently dropped via the `?` early-return.
+    #[test]
+    fn test_parse_pc_variable_continuous_channel_value() {
+        let c = parse_pc_variable_line("tuneCrcPcVariable", "continuousChannelValue, tuneCrc16", None);
+        assert!(c.is_some(), "must parse instead of being silently dropped");
+        let c = c.unwrap();
+        assert!(c.is_pc_variable);
+        assert_eq!(
+            c.tracks_output_channel,
+            Some(("tuneCrc16".to_string(), ChannelTrackingMode::Continuous))
+        );
+    }
+
+    #[test]
+    fn test_parse_pc_variable_channel_value_on_connect() {
+        let c = parse_pc_variable_line("someVar", "channelValueOnConnect, someChannel", None);
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(
+            c.tracks_output_channel,
+            Some(("someChannel".to_string(), ChannelTrackingMode::OnConnect))
+        );
     }
 }
