@@ -88,6 +88,10 @@ export function TableEditor({
   const [isSelecting, setIsSelecting] = useState(false);
   const [editingCell, setEditingCell] = useState<CellPosition | null>(null);
   const [editValue, setEditValue] = useState('');
+  // Axis bin (row/column header) editing - separate from editingCell/editValue
+  // above, which are for Z-grid cells only.
+  const [editingAxis, setEditingAxis] = useState<{ axis: 'x' | 'y'; index: number } | null>(null);
+  const [axisEditValue, setAxisEditValue] = useState('');
   const [clipboard, setClipboard] = useState<number[][] | null>(null);
   const [history, setHistory] = useState<TableData[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -663,8 +667,35 @@ export function TableEditor({
     onChange({ ...data, zValues: newZValues });
   }, [selection, clipboard, data, onChange, pushHistory]);
 
-  // Handle cell click
+  // Format value for display - axis headers below use this too, not just Z
+  // cells, so both round the same way and neither can show raw float noise.
+  // Every WRITE path in this file (handleIncrease/handleDecrease/setEqual/
+  // interpolate/smooth/finishEdit) already falls back to 2 decimals when
+  // data.precision is unset - this used to fall back to 1, showing "4.2"
+  // for a value the table was actually storing as "4.20".
+  const formatValue = useCallback((value: number) => {
+    return value.toFixed(data.precision ?? 2);
+  }, [data.precision]);
+
+  // Opens a Z cell for editing - a plain click (see handleMouseUp below).
+  // formatValue (not raw String()) seeds the box, so it can't show float
+  // noise a value read straight off ECU bytes may carry (same fix as the
+  // axis headers above).
+  const openCellEdit = useCallback((row: number, col: number) => {
+    setEditingCell({ row, col });
+    setEditValue(formatValue(data.zValues[row][col]));
+  }, [data.zValues, formatValue]);
+
+  // gestureActiveRef marks that a mousedown just started ON A GRID CELL, so
+  // the matching global mouseup (handleMouseUp is a document-level
+  // listener - see the useEffect below - so it also fires for a mouseup
+  // anywhere else on the page) knows this specific mouseup is the one that
+  // finishes it, not some unrelated click while an old selection is still
+  // sitting around from earlier.
+  const gestureActiveRef = useRef(false);
+
   const handleCellMouseDown = useCallback((row: number, col: number, e: React.MouseEvent) => {
+    gestureActiveRef.current = true;
     if (e.shiftKey && selection) {
       // Extend selection
       setSelection({ ...selection, end: { row, col } });
@@ -681,30 +712,109 @@ export function TableEditor({
     }
   }, [isSelecting, selection]);
 
+  // A click (1-cell selection), a drag across several cells, or a
+  // shift-click range-extend all end here the same way: open the anchor
+  // cell (selection.start) for editing. For a single cell that's just "you
+  // clicked a cell to edit it" as before; for a multi-cell selection,
+  // finishEdit below applies whatever gets typed to every selected cell at
+  // once instead of only the anchor - the same drag-select-then-type-a-
+  // value-and-Enter pattern the curve editor uses.
   const handleMouseUp = useCallback(() => {
     setIsSelecting(false);
-  }, []);
+    if (gestureActiveRef.current && selection) {
+      gestureActiveRef.current = false;
+      openCellEdit(selection.start.row, selection.start.col);
+    }
+  }, [selection, openCellEdit]);
 
-  // Handle cell double-click for editing
-  const handleCellDoubleClick = useCallback((row: number, col: number) => {
-    setEditingCell({ row, col });
-    setEditValue(String(data.zValues[row][col]));
-  }, [data.zValues]);
-
-  // Handle edit completion
+  // Handle edit completion. More than one cell selected (a drag, not a
+  // plain click) applies the typed value to every selected cell at once,
+  // not just the one showing the input box - same pattern as the curve
+  // editor's multi-cell drag-select.
   const finishEdit = useCallback((save: boolean) => {
     if (editingCell && save) {
       const value = parseFloat(editValue);
       if (!isNaN(value)) {
-        pushHistory();
-        const newZValues = data.zValues.map((row) => [...row]);
-        newZValues[editingCell.row][editingCell.col] = Number(value.toFixed(data.precision ?? 2));
-        onChange({ ...data, zValues: newZValues });
+        const selectedCells = getSelectedCells();
+        const targets = selectedCells.length > 1 ? selectedCells : [editingCell];
+
+        // Single-cell no-op guard only - a bulk edit always applies, even
+        // if the anchor cell's own value looks unchanged, since the other
+        // selected cells may still need it. Prevents a plain click-away
+        // (open then blur with nothing typed) from truncating a value's
+        // real precision to whatever formatValue happened to round it to.
+        const isNoOp = targets.length === 1
+          && value === Number(formatValue(data.zValues[editingCell.row][editingCell.col]));
+
+        if (!isNoOp) {
+          pushHistory();
+          const newZValues = data.zValues.map((row) => [...row]);
+          const rounded = Number(value.toFixed(data.precision ?? 2));
+          targets.forEach(({ row, col }) => {
+            newZValues[row][col] = rounded;
+          });
+          onChange({ ...data, zValues: newZValues });
+        }
       }
     }
     setEditingCell(null);
     setEditValue('');
-  }, [editingCell, editValue, data, onChange, pushHistory]);
+  }, [editingCell, editValue, data, onChange, pushHistory, getSelectedCells, formatValue]);
+
+  // Axis bin (row/column header) editing. A single click opens the cell for
+  // editing right away - unlike the Z grid's headers-select-for-bulk-ops
+  // convention over in TableGrid.tsx, these headers have no other click
+  // behavior to preserve, so there's no reason to require a double-click
+  // first. formatValue (not raw .toString()) seeds the edit box, since a
+  // value read straight off ECU bytes can carry float noise
+  // (413.700000000000005) that the rounded display never showed.
+  const handleAxisClick = useCallback(
+    (axis: 'x' | 'y', index: number) => {
+      setEditingAxis({ axis, index });
+      setAxisEditValue(formatValue(axis === 'x' ? data.xAxis[index] : data.yAxis[index]));
+    },
+    [data.xAxis, data.yAxis, formatValue],
+  );
+
+  const finishAxisEdit = useCallback(
+    (save: boolean) => {
+      if (editingAxis && save) {
+        const value = parseFloat(axisEditValue);
+        const original = editingAxis.axis === 'x' ? data.xAxis[editingAxis.index] : data.yAxis[editingAxis.index];
+        // Skip the write (and the pushHistory below) if nothing was
+        // actually typed - a plain click-away shouldn't spam an edit that
+        // just re-sends the same rounded value, or an undo-history entry
+        // for a no-op.
+        if (!isNaN(value) && value !== Number(formatValue(original))) {
+          pushHistory();
+          if (editingAxis.axis === 'x') {
+            const newXAxis = [...data.xAxis];
+            newXAxis[editingAxis.index] = value;
+            onChange({ ...data, xAxis: newXAxis });
+          } else {
+            const newYAxis = [...data.yAxis];
+            newYAxis[editingAxis.index] = value;
+            onChange({ ...data, yAxis: newYAxis });
+          }
+        }
+      }
+      setEditingAxis(null);
+      setAxisEditValue('');
+    },
+    [editingAxis, axisEditValue, data, onChange, pushHistory, formatValue],
+  );
+
+  const handleAxisKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === 'Enter') {
+        finishAxisEdit(true);
+      } else if (e.key === 'Escape') {
+        setEditingAxis(null);
+        setAxisEditValue('');
+      }
+    },
+    [finishAxisEdit],
+  );
 
   // Keyboard navigation
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -857,7 +967,7 @@ export function TableEditor({
         break;
       case 'Enter':
         e.preventDefault();
-        handleCellDoubleClick(row, col);
+        openCellEdit(row, col);
         break;
     }
     // Keep handled keys (notably "/") from also reaching document-level
@@ -871,7 +981,7 @@ export function TableEditor({
     selection, editingCell, data, finishEdit, getSelectedCells, setEqual,
     adjustValues, scaleValues, interpolate, interpolateHorizontal, interpolateVertical,
     smooth, copySelection, pasteSelection, selectAll, resetToOriginal, floodFill,
-    undo, redo, handleCellDoubleClick, followMode, setFollowMode, yAxisBottom
+    undo, redo, openCellEdit, followMode, setFollowMode, yAxisBottom
   ]);
 
   // Focus input when editing
@@ -897,11 +1007,6 @@ export function TableEditor({
     const maxCol = Math.max(selection.start.col, selection.end.col);
     return row >= minRow && row <= maxRow && col >= minCol && col <= maxCol;
   }, [selection]);
-
-  // Format value for display
-  const formatValue = useCallback((value: number) => {
-    return value.toFixed(data.precision ?? 1);
-  }, [data.precision]);
 
   // Context menu handler
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
@@ -1057,7 +1162,26 @@ export function TableEditor({
               </th>
               {data.xAxis.map((x, i) => (
                 <th key={i} className="table-x-header">
-                  {x}
+                  {editingAxis?.axis === 'x' && editingAxis.index === i ? (
+                    <input
+                      type="text"
+                      className="axis-header-input"
+                      // A bare <input>'s browser-intrinsic min-width
+                      // (~20 characters) survives CSS width/min-width
+                      // overrides and visibly balloons whatever column it
+                      // sits in - only the size attribute itself controls
+                      // it. Axis bin values are always short.
+                      size={4}
+                      value={axisEditValue}
+                      autoFocus
+                      onChange={(e) => setAxisEditValue(e.target.value)}
+                      onBlur={() => finishAxisEdit(true)}
+                      onKeyDown={handleAxisKeyDown}
+                      onFocus={(e) => e.target.select()}
+                    />
+                  ) : (
+                    <span onClick={() => handleAxisClick('x', i)}>{formatValue(x)}</span>
+                  )}
                 </th>
               ))}
             </tr>
@@ -1070,7 +1194,28 @@ export function TableEditor({
               const renderNow = Date.now();
               return (yAxisBottom ? [...data.yAxis.keys()].reverse() : [...data.yAxis.keys()]).map((rowIndex) => (
               <tr key={rowIndex}>
-                <th className="table-y-header">{data.yAxis[rowIndex]}</th>
+                <th className="table-y-header">
+                  {editingAxis?.axis === 'y' && editingAxis.index === rowIndex ? (
+                    <input
+                      type="text"
+                      className="axis-header-input"
+                      // A bare <input>'s browser-intrinsic min-width
+                      // (~20 characters) survives CSS width/min-width
+                      // overrides and visibly balloons whatever column it
+                      // sits in - only the size attribute itself controls
+                      // it. Axis bin values are always short.
+                      size={4}
+                      value={axisEditValue}
+                      autoFocus
+                      onChange={(e) => setAxisEditValue(e.target.value)}
+                      onBlur={() => finishAxisEdit(true)}
+                      onKeyDown={handleAxisKeyDown}
+                      onFocus={(e) => e.target.select()}
+                    />
+                  ) : (
+                    <span onClick={() => handleAxisClick('y', rowIndex)}>{formatValue(data.yAxis[rowIndex])}</span>
+                  )}
+                </th>
                 {data.xAxis.map((_, colIndex) => {
                   const value = data.zValues[rowIndex][colIndex];
                   const isSelected = isCellSelected(rowIndex, colIndex);
@@ -1097,7 +1242,6 @@ export function TableEditor({
                       }}
                       onMouseDown={(e) => handleCellMouseDown(rowIndex, colIndex, e)}
                       onMouseEnter={() => handleCellMouseEnter(rowIndex, colIndex)}
-                      onDoubleClick={() => handleCellDoubleClick(rowIndex, colIndex)}
                     >
                       {isEditing ? (
                         <input
@@ -1107,6 +1251,15 @@ export function TableEditor({
                           value={editValue}
                           onChange={(e) => setEditValue(e.target.value)}
                           onBlur={() => finishEdit(true)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              finishEdit(true);
+                            } else if (e.key === 'Escape') {
+                              e.preventDefault();
+                              finishEdit(false);
+                            }
+                          }}
                         />
                       ) : (
                         formatValue(value)

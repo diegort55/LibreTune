@@ -8,7 +8,6 @@ import TableEditor3D from './TableEditor3D';
 import TableContextMenu from './TableContextMenu';
 import RebinDialog from '../dialogs/RebinDialog';
 import SetTableSizeDialog from '../dialogs/SetTableSizeDialog';
-import CellEditDialog from '../dialogs/CellEditDialog';
 import GenerateTableDialog from '../dialogs/GenerateTableDialog';
 import { classifyGeneratableTable, generatableTableLabel } from '../../utils/tableGenerator';
 import { Dialog, Button, FormField } from '../common';
@@ -70,16 +69,6 @@ interface RebinDialogState {
   show: boolean;
   newXBins: number[];
   newYBins: number[];
-}
-
-/**
- * State for the cell edit dialog.
- */
-interface CellEditDialogState {
-  show: boolean;
-  row: number;
-  col: number;
-  value: number;
 }
 
 /**
@@ -193,13 +182,6 @@ export default function TableEditor2D({
     value: number;
     position?: { top: number; left: number };
   }>({ visible: false, x: 0, y: 0, value: 0 });
-
-  const [cellEditDialog, setCellEditDialog] = useState<CellEditDialogState>({
-    show: false,
-    row: 0,
-    col: 0,
-    value: 0,
-  });
 
   const [scaleDialog, setScaleDialog] = useState<{ show: boolean; factor: string }>({
     show: false,
@@ -672,19 +654,38 @@ export default function TableEditor2D({
     }
   };
 
-  const handleAxisChange = (axis: 'x' | 'y', index: number, value: number) => {
-    if (axis === 'x') {
-      const newBins = [...localXBins];
-      newBins[index] = value;
-      setLocalXBins(newBins);
-      setRebinDialog(prev => ({ ...prev, newXBins: newBins }));
-      pushHistory(localZValues, newBins, localYBins);
-    } else {
-      const newBins = [...localYBins];
-      newBins[index] = value;
-      setLocalYBins(newBins);
-      setRebinDialog(prev => ({ ...prev, newYBins: newBins }));
-      pushHistory(localZValues, localXBins, newBins);
+  // A single bin correction (typing "8.5" over "8") doesn't move any data -
+  // Z[row][col] still means the same cell, just relabeled - so it persists
+  // immediately via rebin_table with interpolateZ: false, the same backend
+  // path the toolbar's explicit "Rebin" flow uses for a real multi-bin
+  // re-layout (interpolateZ: true). This used to only stage the edit into
+  // rebinDialog's draft state (still kept in sync below, since the Rebin
+  // dialog opens from whatever was last typed here) and local display
+  // state, with nothing that ever actually saved it - a header edit looked
+  // like it worked but reverted on reload, or on this table's very first
+  // load if the user edited before anything else touched the cache.
+  const handleAxisChange = async (axis: 'x' | 'y', index: number, value: number) => {
+    const newXBins = axis === 'x' ? (() => { const b = [...localXBins]; b[index] = value; return b; })() : localXBins;
+    const newYBins = axis === 'y' ? (() => { const b = [...localYBins]; b[index] = value; return b; })() : localYBins;
+
+    setLocalXBins(newXBins);
+    setLocalYBins(newYBins);
+    setRebinDialog(prev => ({ ...prev, newXBins, newYBins }));
+
+    try {
+      const result = await invoke<TableOperationResult>('rebin_table', {
+        tableName: table_name,
+        newXBins,
+        newYBins,
+        interpolateZ: false,
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, newXBins, newYBins);
+      }
+    } catch (err) {
+      handleOperationError('Edit axis bin', err);
     }
   };
 
@@ -991,19 +992,6 @@ export default function TableEditor2D({
     } catch (err) {
       handleOperationError('Rebin', err);
     }
-  };
-
-  const handleCellEditApply = (value: number) => {
-    handleCellChange(cellEditDialog.col, cellEditDialog.row, value, { operation: 'Cell edit' });
-  };
-
-  const handleCellDoubleClick = (x: number, y: number) => {
-    setCellEditDialog({
-      show: true,
-      row: y,
-      col: x,
-      value: localZValues[y][x],
-    });
   };
 
   const handleCopy = async () => {
@@ -1390,10 +1378,10 @@ export default function TableEditor2D({
           y_bins={localYBins}
           z_values={localZValues}
           onCellChange={handleCellChange}
+          onBulkCellChange={(value) => applyToSelection(() => value)}
           onAxisChange={handleAxisChange}
           selectionRange={selectionRange}
           onSelectionChange={handleSelectionChange}
-          onCellDoubleClick={handleCellDoubleClick}
           historyTrail={showHistoryTrail ? historyTrail.map(([x, y]) => [x, y] as [number, number]) : []}
           lockedCells={lockedCells}
           onCellLock={handleCellLock}
@@ -1496,19 +1484,6 @@ export default function TableEditor2D({
           }}
         />
       )}
-
-      <CellEditDialog
-        isOpen={cellEditDialog.show}
-        onClose={() => setCellEditDialog({ ...cellEditDialog, show: false })}
-        onApply={handleCellEditApply}
-        currentValue={cellEditDialog.value}
-        cellRow={cellEditDialog.row}
-        cellCol={cellEditDialog.col}
-        xBinValue={rebinDialog.newXBins[cellEditDialog.col] ?? 0}
-        yBinValue={rebinDialog.newYBins[cellEditDialog.row] ?? 0}
-        xAxisName={x_axis_name}
-        yAxisName={y_axis_name}
-      />
 
       <Dialog
         open={scaleDialog.show}

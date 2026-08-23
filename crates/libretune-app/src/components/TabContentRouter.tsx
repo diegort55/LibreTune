@@ -116,12 +116,41 @@ export function TabContentRouter(props: TabContentRouterProps) {
       return (
         <TableEditor
           data={content.data as TunerTableData}
-          onChange={(newData) => {
-            if (activeTabId) {
-              setTabContents({
-                ...tabContents,
-                [activeTabId]: { type: "table", data: newData },
+          onChange={async (newData) => {
+            if (!activeTabId) return;
+            const previousData = content.data as TunerTableData;
+            setTabContents({
+              ...tabContents,
+              [activeTabId]: { type: "table", data: newData },
+            });
+            // TableEditor (tuner-ui) only ever called this to update the
+            // tab's own display state - every edit here (cell values,
+            // nudge/scale/interpolate/smooth, and now axis bin edits) was
+            // silently local-only and never reached the backend, so it
+            // reverted on reload. Mirrors applyGeneratedValues' own
+            // persist-then-display pattern inside TableEditor.tsx: axis
+            // bins go through rebin_table first (interpolateZ: false - a
+            // relabel, not a re-layout, so existing Z stays where it is),
+            // then the Z grid always gets resent to update_table_data,
+            // matching every other editable table/curve in the app.
+            try {
+              const xChanged = newData.xAxis !== previousData.xAxis;
+              const yChanged = newData.yAxis !== previousData.yAxis;
+              if (xChanged || yChanged) {
+                await invoke("rebin_table", {
+                  tableName: newData.name,
+                  newXBins: newData.xAxis,
+                  newYBins: newData.yAxis,
+                  interpolateZ: false,
+                });
+              }
+              await invoke("update_table_data", {
+                tableName: newData.name,
+                zValues: newData.zValues,
               });
+            } catch (err) {
+              console.error("Failed to save table data:", err);
+              showToast("Failed to save table changes", "error");
             }
           }}
           onBurn={() => setBurnDialogOpen(true)}

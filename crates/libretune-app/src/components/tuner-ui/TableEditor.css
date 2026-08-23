@@ -130,6 +130,26 @@
   min-width: 50px;
 }
 
+.table-x-header span,
+.table-y-header span {
+  cursor: pointer;
+}
+
+.axis-header-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-input);
+  border: 1px solid var(--primary);
+  border-radius: 2px;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  text-align: inherit;
+  padding: 0 2px;
+  outline: none;
+}
+
 .table-cell {
   border: 1px solid var(--table-grid-line);
   padding: var(--space-2) var(--space-3);

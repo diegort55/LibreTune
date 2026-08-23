@@ -19,10 +19,14 @@ interface TableGridProps {
   y_bins: number[];
   z_values: number[][];
   onCellChange: (x: number, y: number, value: number) => void;
+  /** Sets every currently-selected cell to one typed value in a single
+   * atomic update (see TableEditor2D's applyToSelection) - used when a
+   * drag-selection spans more than one cell; onCellChange alone would
+   * collapse the selection to just the last cell touched. */
+  onBulkCellChange?: (value: number) => void;
   onAxisChange: (axis: 'x' | 'y', index: number, value: number) => void;
   selectionRange: SelectionRange | null;
   onSelectionChange: (range: SelectionRange | null) => void;
-  onCellDoubleClick?: (x: number, y: number) => void;
   historyTrail?: [number, number][];
   lockedCells?: Set<string>;
   onCellLock?: (x: number, y: number, locked: boolean) => void;
@@ -46,13 +50,18 @@ interface TableGridProps {
   fitViewport?: boolean;
 }
 
-/** Clean axis/bin display — drop noisy decimals when values are whole. */
+/**
+ * Clean axis/bin display, matching TunerStudio's own bin strip (always 2
+ * decimals, e.g. "413.70", "8.00" - not stripped even for a whole number).
+ * The previous version rounded a value >= 100 to a bare integer via
+ * toFixed(0), which silently dropped real precision (413.7 displayed as
+ * "414"); a value read straight off raw ECU bytes can also carry float
+ * noise like 413.700000000000005 if formatted with .toString() instead of
+ * a fixed decimal count - toFixed(2) here rounds that cleanly too.
+ */
 function formatBinLabel(val: number): string {
   if (!Number.isFinite(val)) return '';
-  const rounded = Math.round(val);
-  if (Math.abs(val - rounded) < 1e-6) return String(rounded);
-  if (Math.abs(val) >= 100) return val.toFixed(0);
-  return val.toFixed(1);
+  return val.toFixed(2);
 }
 
 /**
@@ -78,10 +87,10 @@ export default function TableGrid({
   y_bins,
   z_values,
   onCellChange,
+  onBulkCellChange,
   onAxisChange,
   selectionRange,
   onSelectionChange,
-  onCellDoubleClick,
   historyTrail,
   lockedCells,
   isEditing = true,
@@ -198,14 +207,32 @@ export default function TableGrid({
     return { background: color, color: contrastTextColor(color) };
   }, [lockedCells, showColorShade, zBounds, heatmapScheme]);
 
-  const handleKeyDown = (e: KeyboardEvent, x: number, y: number) => {
-    if (e.key === 'Enter' && editingCell) {
+  // Commits editValue to whichever cell(s) it applies to: the whole
+  // selection when it spans more than one cell (a drag, not a plain
+  // click - the same drag-select-then-type-a-value-and-Enter pattern the
+  // curve editor and the tuner-ui table editor use), otherwise just the
+  // one cell passed in.
+  const finishCellEdit = useCallback((x: number, y: number, save: boolean) => {
+    if (save && editingCell) {
       const newValue = parseFloat(editValue);
       if (!isNaN(newValue)) {
-        onCellChange(x, y, newValue);
+        const isMultiSelect = !!selectionRange && (
+          selectionRange.start[0] !== selectionRange.end[0] || selectionRange.start[1] !== selectionRange.end[1]
+        );
+        if (isMultiSelect && onBulkCellChange) {
+          onBulkCellChange(newValue);
+        } else {
+          onCellChange(x, y, newValue);
+        }
       }
-      setEditingCell(null);
-      setEditValue('');
+    }
+    setEditingCell(null);
+    setEditValue('');
+  }, [editingCell, editValue, selectionRange, onBulkCellChange, onCellChange]);
+
+  const handleKeyDown = (e: KeyboardEvent, x: number, y: number) => {
+    if (e.key === 'Enter' && editingCell) {
+      finishCellEdit(x, y, true);
       e.preventDefault();
     } else if (e.key === 'Escape') {
       setEditingCell(null);
@@ -214,10 +241,17 @@ export default function TableGrid({
     }
   };
 
+  // gestureActiveRef marks that a mousedown just started ON A GRID CELL, so
+  // handleMouseUp below (bound to the whole grid container, so it also
+  // fires after e.g. a header drag) knows this specific mouseup is the one
+  // that finishes a cell gesture.
+  const gestureActiveRef = useRef(false);
+
   const handleCellMouseDown = (e: React.MouseEvent, x: number, y: number) => {
     if (e.button === 0 && canEditZ) {
+      gestureActiveRef.current = true;
       let anchor: [number, number];
-      
+
       if (e.shiftKey && selectionRange) {
         // Extend selection from existing anchor
         anchor = selectionRange.start;
@@ -225,13 +259,26 @@ export default function TableGrid({
         // Start new selection
         anchor = [x, y];
       }
-      
+
       setDragAnchor(anchor);
       onSelectionChange({ start: anchor, end: [x, y] });
     }
   };
 
+  // A click (1-cell selection), a drag across several cells, or a
+  // shift-click range-extend all end here the same way: open the anchor
+  // cell (selectionRange.start) for editing. finishCellEdit above decides
+  // whether that box's commit applies to just that cell or the whole
+  // selection.
   const handleMouseUp = () => {
+    if (gestureActiveRef.current && selectionRange && canEditZ) {
+      gestureActiveRef.current = false;
+      const [ax, ay] = selectionRange.start;
+      if (!lockedCells?.has(`${ax},${ay}`)) {
+        setEditingCell([ax, ay]);
+        setEditValue(z_values[ay][ax].toFixed(2));
+      }
+    }
     setDragAnchor(null);
     setHeaderDragStart(null);
   };
@@ -292,14 +339,22 @@ export default function TableGrid({
   const handleHeaderDoubleClick = (axis: 'x' | 'y', index: number) => {
     if (!isEditing) return;
     setEditingAxis({ axis, index });
-    setEditValue((axis === 'x' ? x_bins : y_bins)[index].toString());
+    // .toString() on a value read straight off raw ECU bytes could show
+    // float noise (413.700000000000005) that formatBinLabel's display
+    // string never had - seed the edit box with the same clean rounding
+    // the user is looking at, not the raw underlying float.
+    setEditValue(formatBinLabel((axis === 'x' ? x_bins : y_bins)[index]));
   };
 
   const handleHeaderBlur = () => {
     if (!editingAxis) return;
     const { axis, index } = editingAxis;
     const newValue = parseFloat(editValue);
-    if (!isNaN(newValue)) {
+    // onAxisChange now persists immediately (see TableEditor2D's
+    // handleAxisChange), so a blur with nothing actually typed - clicking
+    // in and back out again - shouldn't fire a redundant backend write.
+    const original = (axis === 'x' ? x_bins : y_bins)[index];
+    if (!isNaN(newValue) && newValue !== Number(formatBinLabel(original))) {
       onAxisChange(axis, index, newValue);
     }
     setEditingAxis(null);
@@ -498,6 +553,7 @@ export default function TableGrid({
               onChange={e => setEditValue(e.target.value)}
               onBlur={handleHeaderBlur}
               onKeyDown={handleHeaderKeyDown}
+              onFocus={e => e.target.select()}
             />
           );
         }
@@ -539,6 +595,7 @@ export default function TableGrid({
             onChange={e => setEditValue(e.target.value)}
             onBlur={handleHeaderBlur}
             onKeyDown={handleHeaderKeyDown}
+            onFocus={e => e.target.select()}
           />
         ) : (
           <div
@@ -580,7 +637,6 @@ export default function TableGrid({
                   data-y={y}
                   style={getCellColor(value, x, y)}
                   onMouseDown={e => handleCellMouseDown(e, x, y)}
-                  onDoubleClick={() => onCellDoubleClick?.(x, y)}
                   onKeyDown={(e) => handleKeyDown(e.nativeEvent, x, y)}
                 >
                   {isEditingThisCell ? (
@@ -591,14 +647,8 @@ export default function TableGrid({
                       className="cell-input"
                       autoFocus
                       onChange={e => setEditValue(e.target.value)}
-                      onBlur={() => {
-                        const newValue = parseFloat(editValue);
-                        if (!isNaN(newValue)) {
-                          onCellChange(x, y, newValue);
-                        }
-                        setEditingCell(null);
-                        setEditValue('');
-                      }}
+                      onBlur={() => finishCellEdit(x, y, true)}
+                      onFocus={e => e.target.select()}
                     />
                   ) : (
                     <span
