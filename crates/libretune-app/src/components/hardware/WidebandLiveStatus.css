@@ -4,6 +4,24 @@
   gap: 16px;
 }
 
+.wbo-tools-row > .nested-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* This panel mixes fields with several full-width command buttons - the
+   default button size (10px/20px padding, 14px font) is meant for a lone
+   button among fields, not a stack of them, and reads much taller/bulkier
+   here than TunerStudio's own compact rusEFI Wideband Tools dialog. */
+.wbo-tools-row .command-button-field {
+  padding: 4px 0;
+}
+
+.wbo-tools-row .command-button {
+  padding: 6px 14px;
+  font-size: 12px;
+}
+
 .wbo-live {
   flex: 0 0 320px;
   border: 1px solid var(--border-color, rgba(128, 140, 160, 0.25));

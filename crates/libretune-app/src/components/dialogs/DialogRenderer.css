@@ -679,7 +679,7 @@
 
 /* Command Button Styles */
 .command-button-field {
-  padding: 8px 0;
+  padding: 5px 0;
 }
 
 .dialog-view .hardware-test-layout {
@@ -808,12 +808,12 @@
 }
 
 .command-button {
-  padding: 10px 20px;
+  padding: 7px 16px;
   background: var(--accent);
   border: 1px solid var(--accent);
   border-radius: 6px;
   color: white;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.2s;
