@@ -666,16 +666,25 @@ export default function CurveEditor({
         // [-35, -40, -20, ...], out of order) without any error. Clamp to
         // the neighbors instead, in whichever direction this curve's bins
         // already run.
+        // A neighbor that's still tied with this cell's own (pre-edit)
+        // value isn't a real ordering boundary yet - it's the common case
+        // of a freshly-added curve where every bin defaults to 0.0. Without
+        // this, no cell but the very last could ever leave 0.0: editing any
+        // interior/first bin would clamp straight back down to its
+        // identical "next" neighbor. Once a bin is actually set to
+        // something else, it becomes a real boundary again for its
+        // neighbors, so the original anti-reorder clamp still applies.
         const ascending =
           localXBins.length < 2 || localXBins[0] <= localXBins[localXBins.length - 1];
+        const ownValue = localXBins[index];
         const prev = index > 0 ? localXBins[index - 1] : undefined;
         const next = index < localXBins.length - 1 ? localXBins[index + 1] : undefined;
         if (ascending) {
-          if (prev !== undefined) clamped = Math.max(clamped, prev);
-          if (next !== undefined) clamped = Math.min(clamped, next);
+          if (prev !== undefined && prev !== ownValue) clamped = Math.max(clamped, prev);
+          if (next !== undefined && next !== ownValue) clamped = Math.min(clamped, next);
         } else {
-          if (prev !== undefined) clamped = Math.min(clamped, prev);
-          if (next !== undefined) clamped = Math.max(clamped, next);
+          if (prev !== undefined && prev !== ownValue) clamped = Math.min(clamped, prev);
+          if (next !== undefined && next !== ownValue) clamped = Math.max(clamped, next);
         }
         const newXBins = [...localXBins];
         newXBins[index] = clamped;
