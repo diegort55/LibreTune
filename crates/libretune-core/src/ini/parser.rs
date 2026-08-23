@@ -464,6 +464,7 @@ fn parse_ini_internal(content: &str, ctx: &mut IncludeContext) -> Result<EcuDefi
     // nothing ever called it, so every table kept `TableRole::Other`.
     if ctx.depth == 0 {
         definition.infer_table_roles();
+        definition.resolve_curve_series_fallback_labels();
     }
     // Envelope byte order stays at the big-endian msEnvelope_1.0 default.
     //
@@ -1756,6 +1757,15 @@ fn parse_curve_editor_entry(
                             parts[0].trim_matches('"').to_string(),
                             parts[1].trim_matches('"').to_string(),
                         );
+                    }
+                    if parts.len() > 2 {
+                        // Some multi-series curves (rusEFI's tccLockCurve)
+                        // name their extra lines here instead of via
+                        // lineLabel - see extra_column_labels' doc comment.
+                        curve.extra_column_labels = parts[2..]
+                            .iter()
+                            .map(|p| p.trim_matches('"').to_string())
+                            .collect();
                     }
                 }
                 "xaxis" => {
@@ -3603,6 +3613,58 @@ yBins = tchargeValues
         assert_eq!(curve.y_bins, "tchargeValues");
         assert!(curve.additional_y_series.is_empty());
         assert!(curve.primary_y_line_label.is_none());
+    }
+
+    /// rusEFI's real tccLockCurve has no lineLabel lines at all - it names
+    /// its two series through columnLabel's 3rd+ entries instead
+    /// (columnLabel = "TPS", "Lock Speed", "Unlock Speed"). Caught by
+    /// visually testing the multi-series feature: the legend showed
+    /// "Series 2" for the second line instead of "Unlock Speed" until this
+    /// fallback was added.
+    #[test]
+    fn curve_series_label_falls_back_to_extra_column_labels() {
+        let ini = "[CurveEditor]
+curve = tccLockCurve, \"TCC Lock Curve\"
+columnLabel = \"TPS\", \"Lock Speed\", \"Unlock Speed\"
+xAxis = 0, 100, 10
+yAxis = 0, 100, 10
+xBins = tcu_tccTpsBins, TPSValue
+yBins = tcu_tccLockSpeed
+yBins = tcu_tccUnlockSpeed
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("tccLockCurve").expect("curve parsed");
+        assert_eq!(curve.additional_y_series.len(), 1);
+        assert_eq!(
+            curve.additional_y_series[0].line_label,
+            Some("Unlock Speed".to_string())
+        );
+        // The primary series still has no explicit lineLabel of its own -
+        // callers fall back to the curve's y_label (column_labels.1) for it,
+        // same as a single-series curve always has.
+        assert!(curve.primary_y_line_label.is_none());
+    }
+
+    /// An explicit lineLabel always wins over the columnLabel fallback, even
+    /// when the INI also happens to have extra columnLabel entries.
+    #[test]
+    fn curve_series_label_explicit_linelabel_beats_column_label_fallback() {
+        let ini = "[CurveEditor]
+curve = mixedCurve, \"Mixed\"
+columnLabel = \"X\", \"Primary\", \"Fallback Name\"
+xBins = mixedXBins
+yBins = mixedPrimary
+yBins = mixedSecondary
+lineLabel = \"Explicit Primary\"
+lineLabel = \"Explicit Secondary\"
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("mixedCurve").expect("curve parsed");
+        assert_eq!(curve.additional_y_series.len(), 1);
+        assert_eq!(
+            curve.additional_y_series[0].line_label,
+            Some("Explicit Secondary".to_string())
+        );
     }
 
     /// An INI picks metric units with `#if CELSIUS`. TunerStudio defines that

@@ -336,6 +336,30 @@ impl EcuDefinition {
         }
     }
 
+    /// Fills in any multi-series curve's missing `lineLabel`s from its
+    /// `columnLabel` list (see [`crate::ini::tables::CurveDefinition::extra_column_labels`]
+    /// for why: some real INIs, e.g. rusEFI's `tccLockCurve`, name a
+    /// two-series curve as `columnLabel = "TPS", "Lock Speed", "Unlock
+    /// Speed"` with no `lineLabel` line at all). Should be called once after
+    /// the INI is fully parsed. Safe to call more than once; only fills gaps,
+    /// never overwrites an explicit `lineLabel`.
+    pub fn resolve_curve_series_fallback_labels(&mut self) {
+        for curve in self.curves.values_mut() {
+            if curve.extra_column_labels.is_empty() {
+                continue;
+            }
+            for (series, fallback) in curve
+                .additional_y_series
+                .iter_mut()
+                .zip(curve.extra_column_labels.iter())
+            {
+                if series.line_label.is_none() {
+                    series.line_label = Some(fallback.clone());
+                }
+            }
+        }
+    }
+
     /// Synthesize a [`DialogDefinition`] for a built-in TunerStudio `std_*`
     /// panel name that the INI references via `panel = std_injection` (or
     /// similar) but does not itself define as a `dialog = ...`.

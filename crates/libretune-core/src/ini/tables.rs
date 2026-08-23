@@ -288,6 +288,16 @@ pub struct CurveDefinition {
     /// leaves this empty.
     #[serde(default)]
     pub additional_y_series: Vec<CurveYSeries>,
+
+    /// `columnLabel` entries beyond the first two (X, Y-axis labels). Some
+    /// real INIs (rusEFI's `tccLockCurve`) name a multi-series curve's lines
+    /// this way instead of `lineLabel` - `columnLabel = "TPS", "Lock Speed",
+    /// "Unlock Speed"` with no `lineLabel` at all - so entry 0 here is the
+    /// fallback name for `additional_y_series[0]`, entry 1 for `[1]`, and so
+    /// on; `EcuDefinition::resolve_curve_series_fallback_labels` fills in
+    /// any `line_label` still `None` after parsing from these positionally.
+    #[serde(default)]
+    pub extra_column_labels: Vec<String>,
 }
 
 /// One extra Y-axis array on a multi-series curve (`y_bins` on
@@ -329,6 +339,7 @@ impl CurveDefinition {
             gauge: None,
             primary_y_line_label: None,
             additional_y_series: Vec::new(),
+            extra_column_labels: Vec::new(),
         }
     }
 }
