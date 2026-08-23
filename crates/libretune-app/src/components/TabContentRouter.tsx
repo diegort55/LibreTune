@@ -140,6 +140,10 @@ export function TabContentRouter(props: TabContentRouterProps) {
                 ...curveData,
                 x_bins: values.xBins,
                 y_bins: values.yBins,
+                additional_y_series: curveData.additional_y_series?.map((series, i) => ({
+                  ...series,
+                  values: values.additionalSeries?.[i] ?? series.values,
+                })),
               };
               setTabContents({
                 ...tabContents,
@@ -150,6 +154,7 @@ export function TabContentRouter(props: TabContentRouterProps) {
                   curveName: curveData.name,
                   xValues: values.xBins,
                   yValues: values.yBins,
+                  additionalYValues: values.additionalSeries,
                 });
               } catch (err) {
                 console.error("Failed to save curve data:", err);

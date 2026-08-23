@@ -111,7 +111,7 @@ export interface CurveData {
   gauge?: string | null;
   /** `lineLabel` matched to the primary `y_bins` series when the curve has more than one (§9.2.1). */
   primary_y_line_label?: string | null;
-  /** Extra reference lines beyond the primary `y_bins` series - read-only here, same X bins. */
+  /** Extra series beyond the primary `y_bins` series - each its own editable table row and chart line, sharing x_bins. */
   additional_y_series?: CurveSeriesData[];
 }
 
@@ -139,6 +139,8 @@ const ADDITIONAL_SERIES_COLORS = [
 export interface CurveBinValues {
   xBins: number[];
   yBins: number[];
+  /** One array per §9.2.1 additional series, in `data.additional_y_series` order. */
+  additionalSeries?: number[][];
 }
 
 interface CurveEditorProps {
@@ -204,13 +206,29 @@ export default function CurveEditor({
   // Local copies for editing
   const [localXBins, setLocalXBins] = useState<number[]>([...safeXBinsArray]);
   const [localYBins, setLocalYBins] = useState<number[]>([...safeYBins]);
-  // Selected point index
+  // One array per §9.2.1 additional series (data.additional_y_series order) - each its own editable table row.
+  const [localAdditionalSeries, setLocalAdditionalSeries] = useState<number[][]>(
+    (hasValidData ? data.additional_y_series : undefined)?.map((s) => [...s.values]) ?? [],
+  );
+  // Selected point index - drives the chart's point marker/drag and the
+  // container-level keyboard nudge, both of which only ever act on the
+  // primary series regardless of which table row was clicked.
   const [selectedPoint, setSelectedPoint] = useState<number | null>(null);
+  // Table cell range selection - a rectangle from selectionAnchor to
+  // selectionEnd (inclusive) over (bin index, row) space, built by dragging
+  // across cells like a spreadsheet. A plain click (mousedown+mouseup with
+  // no drag in between) leaves anchor === end, a 1-cell "range" - see
+  // selectedRangeCells below, which both the single-cell click path and the
+  // multi-cell bulk-edit path read from, so there's one code path for both.
+  const [selectionAnchor, setSelectionAnchor] = useState<{ index: number; axis: 'x' | 'y' | number } | null>(null);
+  const [selectionEnd, setSelectionEnd] = useState<{ index: number; axis: 'x' | 'y' | number } | null>(null);
+  const [isRangeDragging, setIsRangeDragging] = useState(false);
   // Dragging state
   const [isDragging, setIsDragging] = useState(false);
   const [dragPointIndex, setDragPointIndex] = useState<number | null>(null);
-  // Table input value for editing
-  const [editingCell, setEditingCell] = useState<{ index: number; axis: 'x' | 'y' } | null>(null);
+  // Table input value for editing. axis is 'x'/'y' for the shared/primary
+  // rows, or a number indexing data.additional_y_series for an extra row.
+  const [editingCell, setEditingCell] = useState<{ index: number; axis: 'x' | 'y' | number } | null>(null);
   const [editValue, setEditValue] = useState<string>('');
   // Undo/Redo history
   const [history, setHistory] = useState<CurveBinValues[]>([]);
@@ -246,8 +264,9 @@ export default function CurveEditor({
     if (hasValidData) {
       setLocalXBins([...data.x_bins]);
       setLocalYBins([...data.y_bins]);
+      setLocalAdditionalSeries((data.additional_y_series ?? []).map((s) => [...s.values]));
     }
-  }, [hasValidData, data?.x_bins, data?.y_bins]);
+  }, [hasValidData, data?.x_bins, data?.y_bins, data?.additional_y_series]);
 
   // Click-outside handler for context menu
   useEffect(() => {
@@ -451,22 +470,27 @@ export default function CurveEditor({
   }, [hasValidData, xOutputChannelValue, data?.x_output_channel, localXBins, localYBins, scaleX, scaleY]);
 
   // Persist changes to backend
-  const persistCurveValues = useCallback(async (xBins: number[], yBins: number[]) => {
+  const persistCurveValues = useCallback(async (xBins: number[], yBins: number[], additionalSeries: number[][] = localAdditionalSeries) => {
     try {
       await invoke('update_curve_data', {
         curveName: data.name,
         xValues: xBins,
         yValues: yBins,
+        additionalYValues: additionalSeries,
       });
-      onValuesChange?.({ xBins, yBins });
+      onValuesChange?.({ xBins, yBins, additionalSeries });
     } catch (err) {
       console.error('Failed to update curve:', err);
     }
-  }, [data.name, onValuesChange]);
+  }, [data.name, onValuesChange, localAdditionalSeries]);
 
   const currentSnapshot = useCallback(
-    (): CurveBinValues => ({ xBins: [...localXBins], yBins: [...localYBins] }),
-    [localXBins, localYBins],
+    (): CurveBinValues => ({
+      xBins: [...localXBins],
+      yBins: [...localYBins],
+      additionalSeries: localAdditionalSeries.map((s) => [...s]),
+    }),
+    [localXBins, localYBins, localAdditionalSeries],
   );
 
   // Push current state to history before making changes
@@ -482,10 +506,12 @@ export default function CurveEditor({
   const undo = useCallback(() => {
     if (historyIndex >= 0) {
       const previousState = history[historyIndex];
+      const additionalSeries = previousState.additionalSeries ?? [];
       setLocalXBins(previousState.xBins);
       setLocalYBins(previousState.yBins);
+      setLocalAdditionalSeries(additionalSeries);
       setHistoryIndex(historyIndex - 1);
-      persistCurveValues(previousState.xBins, previousState.yBins);
+      persistCurveValues(previousState.xBins, previousState.yBins, additionalSeries);
     }
   }, [history, historyIndex, persistCurveValues]);
 
@@ -493,10 +519,12 @@ export default function CurveEditor({
   const redo = useCallback(() => {
     if (historyIndex < history.length - 1) {
       const nextState = history[historyIndex + 1];
+      const additionalSeries = nextState.additionalSeries ?? [];
       setHistoryIndex(historyIndex + 1);
       setLocalXBins(nextState.xBins);
       setLocalYBins(nextState.yBins);
-      persistCurveValues(nextState.xBins, nextState.yBins);
+      setLocalAdditionalSeries(additionalSeries);
+      persistCurveValues(nextState.xBins, nextState.yBins, additionalSeries);
     }
   }, [history, historyIndex, persistCurveValues]);
 
@@ -651,59 +679,235 @@ export default function CurveEditor({
     };
   }, [isDragging, updateDragFromClientY, handleMouseUp]);
 
+  // A cell's current value, for any row: 'x' (shared bins), 'y' (primary
+  // series), or a number indexing an additional §9.2.1 series row.
+  const cellValue = useCallback(
+    (index: number, axis: 'x' | 'y' | number): number => {
+      if (axis === 'x') return localXBins[index] ?? 0;
+      if (axis === 'y') return localYBins[index] ?? 0;
+      return localAdditionalSeries[axis]?.[index] ?? 0;
+    },
+    [localXBins, localYBins, localAdditionalSeries],
+  );
+
+  // Table row order top-to-bottom, for Up/Down cell navigation: primary Y,
+  // then each visible additional series, then the shared X row - matches
+  // renderCurveTableBody's actual rendering order below.
+  const rowOrder = useMemo<Array<'x' | 'y' | number>>(() => {
+    const seriesRows = (data.additional_y_series ?? [])
+      .map((s, i) => (s.visible ? i : null))
+      .filter((i): i is number => i !== null);
+    return ['y', ...seriesRows, 'x'];
+  }, [data.additional_y_series]);
+
+  // Rectangular selection over (bin index, row) space, built by dragging.
+  // anchor === end for a plain click - a 1-cell "range". A row's readOnly
+  // cells stay part of the visual selection (matches clicking one alone,
+  // which still selects it for viewing) but are skipped when a bulk edit
+  // actually commits, below.
+  const selectedRangeCells = useMemo(() => {
+    if (!selectionAnchor || !selectionEnd) return [];
+    const rowLo = Math.min(rowOrder.indexOf(selectionAnchor.axis), rowOrder.indexOf(selectionEnd.axis));
+    const rowHi = Math.max(rowOrder.indexOf(selectionAnchor.axis), rowOrder.indexOf(selectionEnd.axis));
+    const colLo = Math.min(selectionAnchor.index, selectionEnd.index);
+    const colHi = Math.max(selectionAnchor.index, selectionEnd.index);
+    const cells: Array<{ index: number; axis: 'x' | 'y' | number }> = [];
+    for (let r = rowLo; r <= rowHi; r++) {
+      for (let c = colLo; c <= colHi; c++) {
+        cells.push({ index: c, axis: rowOrder[r] });
+      }
+    }
+    return cells;
+  }, [selectionAnchor, selectionEnd, rowOrder]);
+
+  const isRowReadOnly = useCallback(
+    (axis: 'x' | 'y' | number) =>
+      axis === 'x' ? !!data.x_bins_read_only : axis === 'y' ? !!data.y_bins_read_only : false,
+    [data.x_bins_read_only, data.y_bins_read_only],
+  );
+
   const commitCellEdit = useCallback(
-    (index: number, axis: 'x' | 'y') => {
+    (index: number, axis: 'x' | 'y' | number) => {
       const parsed = parseFloat(editValue);
       if (isNaN(parsed)) {
         setEditingCell(null);
         return;
       }
 
-      if (axis === 'x') {
-        const clamped = clampXBinEdit(localXBins, index, parsed, xAxis.min, xAxis.max);
-        const newXBins = [...localXBins];
-        newXBins[index] = clamped;
-        setLocalXBins(newXBins);
-        persistCurveValues(newXBins, localYBins);
-      } else {
-        const clamped = Math.max(yAxis.min, Math.min(yAxis.max, parsed));
-        const newYBins = [...localYBins];
-        newYBins[index] = clamped;
-        setLocalYBins(newYBins);
-        persistCurveValues(localXBins, newYBins);
+      // More than one cell selected (a drag, not a plain click) - Enter
+      // applies the typed value to every selected cell, not just the one
+      // showing the input (see handleMouseUpGlobal, which only opens the
+      // input on the anchor cell of a multi-cell drag).
+      const targets = selectedRangeCells.length > 1 ? selectedRangeCells : [{ index, axis }];
+
+      // A single click opens edit mode immediately (see handleCellClick),
+      // so a click-then-click-elsewhere with no typing in between reaches
+      // here too via onBlur (and now also an ArrowLeft/Right/Up/Down that
+      // navigates away without editing). editValue was seeded from the real
+      // value rounded to a whole number for display; if the parsed result
+      // still matches that rounding, nothing was actually typed - skip the
+      // write so browsing/navigating can't quietly truncate a value's real
+      // precision (e.g. 18.4373 -> 18) or spam the undo history with no-op
+      // entries. Only applies to a single targeted cell - a bulk edit
+      // always applies, even if the anchor cell's own value looks
+      // unchanged, since the other selected cells may still need it.
+      if (targets.length === 1) {
+        const original = cellValue(index, axis);
+        if (parsed === Number(original.toFixed(0))) {
+          setEditingCell(null);
+          return;
+        }
+      }
+
+      pushHistory();
+
+      let newXBins = localXBins;
+      let newYBins = localYBins;
+      let newSeries = localAdditionalSeries;
+      let xChanged = false;
+      let yChanged = false;
+      let seriesChanged = false;
+
+      for (const t of targets) {
+        if (isRowReadOnly(t.axis)) continue;
+        if (t.axis === 'x') {
+          if (!xChanged) {
+            newXBins = [...localXBins];
+            xChanged = true;
+          }
+          newXBins[t.index] = clampXBinEdit(newXBins, t.index, parsed, xAxis.min, xAxis.max);
+        } else if (t.axis === 'y') {
+          if (!yChanged) {
+            newYBins = [...localYBins];
+            yChanged = true;
+          }
+          newYBins[t.index] = Math.max(yAxis.min, Math.min(yAxis.max, parsed));
+        } else {
+          // Additional series share the curve's single Y axis (TunerStudio
+          // plots them all on the same %/value scale).
+          if (!seriesChanged) {
+            newSeries = localAdditionalSeries.map((s) => [...s]);
+            seriesChanged = true;
+          }
+          newSeries[t.axis][t.index] = Math.max(yAxis.min, Math.min(yAxis.max, parsed));
+        }
+      }
+
+      if (xChanged) setLocalXBins(newXBins);
+      if (yChanged) setLocalYBins(newYBins);
+      if (seriesChanged) setLocalAdditionalSeries(newSeries);
+      if (xChanged || yChanged || seriesChanged) {
+        persistCurveValues(newXBins, newYBins, newSeries);
       }
       setEditingCell(null);
+      if (targets.length > 1) {
+        setSelectionAnchor(null);
+        setSelectionEnd(null);
+      }
     },
-    [editValue, xAxis, yAxis, localXBins, localYBins, persistCurveValues],
+    [
+      editValue,
+      xAxis,
+      yAxis,
+      localXBins,
+      localYBins,
+      localAdditionalSeries,
+      cellValue,
+      selectedRangeCells,
+      isRowReadOnly,
+      pushHistory,
+      persistCurveValues,
+    ],
   );
 
-  // Handle table cell edit
-  const handleCellDoubleClick = (index: number, axis: 'x' | 'y') => {
-    const readOnly = axis === 'x' ? data.x_bins_read_only : data.y_bins_read_only;
-    if (readOnly) return;
-    pushHistory();
+  // A plain click both selects the point (for the chart/keyboard nav, same
+  // as before) and - unless the axis is readOnly - opens that cell for
+  // editing immediately. TunerStudio's own bin table doesn't need a
+  // double-click first; requiring one here was just friction, and the value
+  // shown while editing matches the whole-number display format (no
+  // decimals - TunerStudio's own strip doesn't show any either). Also used
+  // by arrow-key navigation and to open the anchor cell after a multi-cell
+  // drag selection - both just want "select and edit exactly this cell".
+  const handleCellClick = (index: number, axis: 'x' | 'y' | number) => {
+    setSelectedPoint(index);
+    setSelectionAnchor({ index, axis });
+    setSelectionEnd({ index, axis });
+    containerRef.current?.focus();
+
+    if (isRowReadOnly(axis)) return;
     setEditingCell({ index, axis });
-    setEditValue(
-      (axis === 'x' ? localXBins[index] : localYBins[index]).toFixed(2),
-    );
+    setEditValue(cellValue(index, axis).toFixed(0));
   };
 
-  const handleCellKeyDown = (e: React.KeyboardEvent, index: number, axis: 'x' | 'y') => {
+  // Drag-select across cells (own row or spanning rows) like a spreadsheet -
+  // mousedown starts a new 1-cell selection, mouseenter while dragging
+  // extends it to a rectangle (see selectedRangeCells), and the global
+  // mouseup below decides what the gesture meant: no movement is a plain
+  // click (select + edit that one cell, existing behavior); real movement
+  // opens the anchor cell for editing but leaves the whole range selected,
+  // so committing (Enter) fills every selected cell with the typed value.
+  const handleCellMouseDown = (index: number, axis: 'x' | 'y' | number) => {
+    setIsRangeDragging(true);
+    setSelectionAnchor({ index, axis });
+    setSelectionEnd({ index, axis });
+  };
+
+  const handleCellMouseEnter = (index: number, axis: 'x' | 'y' | number) => {
+    if (!isRangeDragging) return;
+    setSelectionEnd({ index, axis });
+  };
+
+  // Ends a table drag-selection wherever the mouse is released, even
+  // outside the table (window-level, matching the chart-point drag effect
+  // above). No movement between mousedown and mouseup is a plain click.
+  useEffect(() => {
+    if (!isRangeDragging) return;
+    const onMouseUp = () => {
+      setIsRangeDragging(false);
+      if (!selectionAnchor || !selectionEnd) return;
+      const isSingleCell =
+        selectionAnchor.index === selectionEnd.index && selectionAnchor.axis === selectionEnd.axis;
+      if (isSingleCell) {
+        handleCellClick(selectionAnchor.index, selectionAnchor.axis);
+        return;
+      }
+      containerRef.current?.focus();
+      if (!isRowReadOnly(selectionAnchor.axis)) {
+        setEditingCell({ index: selectionAnchor.index, axis: selectionAnchor.axis });
+        setEditValue(cellValue(selectionAnchor.index, selectionAnchor.axis).toFixed(0));
+      }
+    };
+    window.addEventListener('mouseup', onMouseUp);
+    return () => window.removeEventListener('mouseup', onMouseUp);
+  }, [isRangeDragging, selectionAnchor, selectionEnd, cellValue, isRowReadOnly]);
+
+  // Arrow keys move to the neighboring cell instead of the browser's default
+  // text-cursor movement - Left/Right across bins in the same row, Up/Down
+  // to the same bin in the row above/below (rowOrder). Committing first
+  // means a value typed before arrowing away is saved, same as Enter/blur.
+  const handleCellKeyDown = (e: React.KeyboardEvent, index: number, axis: 'x' | 'y' | number) => {
     if (e.key === 'Enter') {
       commitCellEdit(index, axis);
     } else if (e.key === 'Escape') {
       setEditingCell(null);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      commitCellEdit(index, axis);
+      const delta = e.key === 'ArrowRight' ? 1 : -1;
+      const nextIndex = Math.max(0, Math.min(localXBins.length - 1, index + delta));
+      handleCellClick(nextIndex, axis);
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      commitCellEdit(index, axis);
+      const delta = e.key === 'ArrowDown' ? 1 : -1;
+      const currentRow = rowOrder.indexOf(axis);
+      const nextRow = rowOrder[Math.max(0, Math.min(rowOrder.length - 1, currentRow + delta))];
+      handleCellClick(index, nextRow);
     }
   };
 
-  const handleCellBlur = (index: number, axis: 'x' | 'y') => {
+  const handleCellBlur = (index: number, axis: 'x' | 'y' | number) => {
     commitCellEdit(index, axis);
-  };
-
-  // Handle row click to select
-  const handleRowClick = (index: number) => {
-    setSelectedPoint(index);
-    containerRef.current?.focus();
   };
 
   // Context menu handlers
@@ -837,13 +1041,24 @@ Suggestion: {errorInfo.suggestion}
 
   console.log(`[CurveEditor] Rendering curve '${data.name}' in ${embedded ? 'embedded' : 'standalone'} mode with ${localXBins.length} points`);
 
-  // TunerStudio lays this out as two rows (Y values, then X values) with one
-  // column per bin, not one row per bin - a tall N-row/2-column list reads
-  // as a wall of numbers next to a wide chart, where a 2-row strip reads at
-  // a glance and matches the axes it labels left-to-right under the plot.
-  const renderCurveTableAxisRow = (axis: 'x' | 'y', label: string, values: (number | undefined)[], range: { min: number; max: number }, readOnly: boolean) => (
+  // TunerStudio lays this out as one row per Y series plus one shared row
+  // for the X bins at the bottom, one column per bin - matching its own
+  // multi-series curve dialogs (e.g. "Line Pressure Per Gear Steady State"),
+  // rather than a tall N-row/2-column list of numbers beside the chart.
+  const renderCurveTableAxisRow = (
+    axis: 'x' | 'y' | number,
+    label: string,
+    values: (number | undefined)[],
+    range: { min: number; max: number },
+    readOnly: boolean,
+    color?: string,
+  ) => (
     <tr key={axis} className={readOnly ? 'read-only' : ''}>
-      <th className="curve-table-row-label" title={readOnly ? 'Locked by the INI - tracks a fixed reference axis' : undefined}>
+      <th
+        className="curve-table-row-label"
+        title={readOnly ? 'Locked by the INI - tracks a fixed reference axis' : undefined}
+        style={color ? { color } : undefined}
+      >
         {label}
         {readOnly && <Lock size={10} aria-label="Read-only" />}
       </th>
@@ -851,29 +1066,42 @@ Suggestion: {errorInfo.suggestion}
         const value = v ?? 0;
         const cellStyle = getHeatmapCellStyle(value, range.min, range.max);
         const editing = editingCell?.index === i && editingCell.axis === axis;
+        const cellClassName = axis === 'x' ? 'x-cell' : 'y-cell';
+
+        const inSelection = selectedRangeCells.some((c) => c.index === i && c.axis === axis);
 
         return (
           <td
             key={i}
-            className={`${axis}-cell${selectedPoint === i ? ' selected' : ''}`}
+            className={`${cellClassName}${inSelection ? ' selected' : ''}`}
             style={cellStyle}
-            onClick={() => handleRowClick(i)}
-            onDoubleClick={() => handleCellDoubleClick(i, axis)}
+            onMouseDown={() => handleCellMouseDown(i, axis)}
+            onMouseEnter={() => handleCellMouseEnter(i, axis)}
           >
             {editing ? (
               <input
                 type="text"
+                // A bare <input> defaults to a browser-intrinsic min-width
+                // around 20 characters, and that floor holds regardless of
+                // table-layout - CSS min-width/width alone can't override
+                // it, only this attribute can. Values here are always short
+                // whole numbers (see toFixed(0) below); a 3- or 4-digit
+                // value still fits by scrolling within the box once typed,
+                // this only sets the box's resting size.
+                size={3}
                 value={editValue}
                 onChange={(e) => setEditValue(e.target.value)}
                 onKeyDown={(e) => handleCellKeyDown(e, i, axis)}
                 onBlur={() => handleCellBlur(i, axis)}
+                onFocus={(e) => e.target.select()}
                 autoFocus
               />
             ) : (
-              // TunerStudio's own bin-value strip shows one decimal place
-              // ("14.5", not "14.30") - matching it also buys back the width
-              // this table needs to fit its columns without scrolling.
-              value.toFixed(1)
+              // TunerStudio's own bin-value strip shows whole numbers, no
+              // decimals ("14", not "14.30" or even "14.3") - matching it
+              // also buys back the width this table needs to fit its
+              // columns without scrolling.
+              value.toFixed(0)
             )}
           </td>
         );
@@ -881,12 +1109,34 @@ Suggestion: {errorInfo.suggestion}
     </tr>
   );
 
-  const renderCurveTableBody = () => (
-    <>
-      {renderCurveTableAxisRow('y', data.y_label, localYBins, yAxis, !!data.y_bins_read_only)}
-      {renderCurveTableAxisRow('x', data.x_label, localXBins, xAxis, !!data.x_bins_read_only)}
-    </>
-  );
+  const renderCurveTableBody = () => {
+    const additionalSeries = data.additional_y_series ?? [];
+    return (
+      <>
+        {renderCurveTableAxisRow(
+          'y',
+          data.primary_y_line_label ?? data.y_label,
+          localYBins,
+          yAxis,
+          !!data.y_bins_read_only,
+          additionalSeries.length ? '#f5d742' : undefined,
+        )}
+        {additionalSeries.map((series, i) =>
+          series.visible
+            ? renderCurveTableAxisRow(
+                i,
+                series.label ?? `Series ${i + 2}`,
+                localAdditionalSeries[i] ?? [],
+                yAxis,
+                false,
+                ADDITIONAL_SERIES_COLORS[i % ADDITIONAL_SERIES_COLORS.length],
+              )
+            : null,
+        )}
+        {renderCurveTableAxisRow('x', data.x_label, localXBins, xAxis, !!data.x_bins_read_only)}
+      </>
+    );
+  };
 
   return (
     <div
@@ -1020,15 +1270,19 @@ Suggestion: {errorInfo.suggestion}
               {data.y_label}
             </text>
 
-            {/* Additional Y series (§9.2.1) - reference lines only, not
-                draggable/editable; the primary series below stays the only
-                interactive one. Drawn first so the primary line and its
-                points sit on top. */}
+            {/* Additional Y series (§9.2.1) - editable via their own table
+                row (see renderCurveTableBody), but not draggable on the
+                chart itself; the primary series below stays the only one
+                with chart-point handles. Drawn first so the primary line
+                and its points sit on top. Reads localAdditionalSeries (not
+                the data prop) so a table edit here updates the chart
+                immediately, same as the primary line. */}
             {(data.additional_y_series ?? []).map((series, seriesIdx) => {
               if (!series.visible) return null;
               const color = ADDITIONAL_SERIES_COLORS[seriesIdx % ADDITIONAL_SERIES_COLORS.length];
+              const seriesValues = localAdditionalSeries[seriesIdx] ?? series.values;
               const points = localXBins
-                .map((x, i) => `${scaleX(x ?? 0)},${scaleY(series.values[i] ?? 0)}`)
+                .map((x, i) => `${scaleX(x ?? 0)},${scaleY(seriesValues[i] ?? 0)}`)
                 .join(' ');
               return (
                 <polyline

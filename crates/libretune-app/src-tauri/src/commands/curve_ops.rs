@@ -454,15 +454,17 @@ fn write_constant_array_values(
     Ok(())
 }
 
-/// Updates curve X and/or Y bin values in the tune cache and optionally writes to ECU.
+/// Updates curve X and/or Y bin values (including additional §9.2.1 series)
+/// in the tune cache and optionally writes to ECU.
 #[tauri::command]
 pub async fn update_curve_data(
     state: tauri::State<'_, AppState>,
     curve_name: String,
     y_values: Option<Vec<f64>>,
     x_values: Option<Vec<f64>>,
+    additional_y_values: Option<Vec<Vec<f64>>>,
 ) -> Result<(), String> {
-    if y_values.is_none() && x_values.is_none() {
+    if y_values.is_none() && x_values.is_none() && additional_y_values.is_none() {
         return Err("No curve values provided".to_string());
     }
 
@@ -471,7 +473,7 @@ pub async fn update_curve_data(
     // conn.write_memory() call starves every other command that needs the
     // definition (e.g. load_tune, table/curve reads). Matches the
     // established pattern in update_constant/update_constant_array_internal.
-    let (x_ctx, x_const, x_bins_read_only, y_ctx, y_const, y_bins_read_only) = {
+    let (x_ctx, x_const, x_bins_read_only, y_ctx, y_const, y_bins_read_only, additional_series) = {
         let def_guard = state.definition.lock().await;
         let def = def_guard.as_ref().ok_or("Definition not loaded")?;
 
@@ -521,6 +523,26 @@ pub async fn update_curve_data(
                 .unwrap_or(256) as usize,
         };
 
+        // Same (constant, WriteContext) snapshot as x_const/y_const above,
+        // one per §9.2.1 additional series, in curve.additional_y_series
+        // order - the order additional_y_values must arrive in.
+        let additional_series: Vec<(Constant, WriteContext)> = curve
+            .additional_y_series
+            .iter()
+            .filter_map(|series| {
+                let constant = def.constants.get(&series.bins)?;
+                let ctx = WriteContext {
+                    endianness: def.endianness,
+                    default_page_bytes: def
+                        .page_sizes
+                        .get(constant.page as usize)
+                        .copied()
+                        .unwrap_or(256) as usize,
+                };
+                Some((constant.clone(), ctx))
+            })
+            .collect();
+
         (
             x_ctx,
             x_const,
@@ -528,6 +550,7 @@ pub async fn update_curve_data(
             y_ctx,
             y_const,
             y_bins_read_only,
+            additional_series,
         )
     };
 
@@ -575,6 +598,22 @@ pub async fn update_curve_data(
                 &y_ctx,
                 &y_const,
                 &values,
+                cache,
+                &mut tune_guard,
+                &mut modified_guard,
+                &mut conn,
+            )?;
+        }
+    }
+
+    // No readOnly concept exists for additional series - only x_bins/y_bins
+    // carry that INI flag - so every one of these is always writable.
+    if let Some(all_values) = additional_y_values {
+        for (values, (constant, ctx)) in all_values.iter().zip(additional_series.iter()) {
+            write_constant_array_values(
+                ctx,
+                constant,
+                values,
                 cache,
                 &mut tune_guard,
                 &mut modified_guard,

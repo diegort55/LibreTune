@@ -279,7 +279,7 @@
 .curve-bottom-section .curve-data-table table {
   width: auto;
   min-width: 100%;
-  table-layout: auto;
+  table-layout: fixed;
 }
 
 .curve-bottom-section .curve-data-table th,
@@ -294,6 +294,16 @@
   border-collapse: collapse;
   font-size: 12px;
   font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  /* auto layout measures each cell's own intrinsic content width to size
+     columns - and a bare <input> reports a large default intrinsic width
+     (~150-200px in most browsers) regardless of any width: 100% CSS on it,
+     since that percentage can't resolve until the column width is already
+     decided. table-layout: fixed sidesteps this entirely: column widths
+     come only from the first row's cells (the row-label th below, plus
+     each data column splitting whatever's left evenly), never from a
+     later row's content - so clicking a cell into edit mode can no longer
+     balloon just that one column. */
+  table-layout: fixed;
 }
 
 .curve-data-table th {
@@ -304,12 +314,20 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.15);
 }
 
-/* One row per axis (Y values, then X values) rather than one row per bin -
-   the row label sits sticky on the left, like TunerStudio's own strip. */
+/* One row per Y series (colored per ADDITIONAL_SERIES_COLORS on a
+   multi-series curve, §9.2.1) plus one shared row for the X bins, rather
+   than one row per bin - the row label sits sticky on the left, like
+   TunerStudio's own strip. table-layout: fixed (see .curve-data-table
+   table above) takes this width as the column's final width rather than
+   a lower bound, so a longer series label (e.g. "Manual 3rd") ellipsizes
+   instead of growing the column - widened a bit from the original 2-row
+   (Y, X) table to give those more room. */
 .curve-data-table th.curve-table-row-label {
   position: sticky;
   left: 0;
-  width: 52px;
+  width: 68px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   text-align: left;
   background: rgba(40, 40, 45, 0.98);
   z-index: 1;
@@ -320,6 +338,11 @@
   text-align: center;
   color: var(--text-primary);
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  /* Dragging across cells to multi-select (see handleCellMouseDown/Enter)
+     would otherwise also trigger the browser's native text-selection drag
+     on these numbers - doesn't apply to the editing <input>, which still
+     needs normal text selection for onFocus's select-all-to-overwrite. */
+  user-select: none;
 }
 
 .curve-data-table tr:last-child th,
@@ -332,6 +355,12 @@
   cursor: pointer;
   font-weight: 500;
   transition: background 0.15s;
+  /* Matches the editing input's min-width below so a column doesn't visibly
+     widen the instant one of its cells is clicked into edit mode - it's
+     already this wide at rest. Values display with no decimals (see
+     value.toFixed(0) below), so the widest realistic content is something
+     like "-100", not "-100.0". */
+  min-width: 34px;
 }
 
 .curve-data-table td.selected {
@@ -357,21 +386,24 @@
 
 .curve-data-table .x-cell input,
 .curve-data-table .y-cell input {
-  /* The cell (and this input at width: 100%) is sized to the *display*
-     text, e.g. "-30.0" - too tight to also show a typed-out "-30.00" once
-     focus scrolls to the cursor at the end, clipping the leading "-" out of
-     view. A min-width gives editing room; table-layout: auto grows the
-     column/cell to match. */
+  /* No min-width here - the `size={3}` HTML attribute on the input (not a
+     CSS property) is what actually controls its intrinsic floor in
+     table-layout: fixed; adding a CSS min-width on top of that only risks
+     re-introducing a mismatch with the resting (non-editing) cell's own
+     width. A near-invisible border (vs. the earlier solid blue box) keeps
+     the swap from reading as the cell "popping" even for any remaining
+     sub-pixel difference. */
   width: 100%;
-  min-width: 56px;
   box-sizing: border-box;
-  padding: 2px 4px;
-  background: rgba(0, 0, 0, 0.5);
-  border: 1px solid #4a9eff;
-  border-radius: 3px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid #4a9eff;
   color: var(--text-primary);
   font-family: inherit;
   font-size: inherit;
+  font-weight: inherit;
   text-align: center;
   outline: none;
 }

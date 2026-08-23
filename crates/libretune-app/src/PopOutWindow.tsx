@@ -290,13 +290,17 @@ export default function PopOutWindow() {
     }).catch(console.error);
   }, [popOutData]);
 
-  const handleCurveChange = useCallback((values: { xBins: number[]; yBins: number[] }) => {
+  const handleCurveChange = useCallback((values: { xBins: number[]; yBins: number[]; additionalSeries?: number[][] }) => {
     if (!popOutData || popOutData.type !== 'curve' || !popOutData.data) return;
     const curveData = popOutData.data as CurveData;
     const updatedData = {
       ...curveData,
       x_bins: values.xBins,
       y_bins: values.yBins,
+      additional_y_series: curveData.additional_y_series?.map((series, i) => ({
+        ...series,
+        values: values.additionalSeries?.[i] ?? series.values,
+      })),
     };
     setPopOutData(prev => prev ? { ...prev, data: updatedData } : null);
     emit('table:updated', {
