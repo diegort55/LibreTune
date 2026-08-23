@@ -238,6 +238,26 @@ export default function TableGrid({
       setEditingCell(null);
       setEditValue('');
       e.preventDefault();
+    } else if (
+      editingCell &&
+      (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')
+    ) {
+      // Commits what's typed so far (same as Enter), then opens the
+      // neighboring cell for editing - same arrow-key-moves-to-the-next-
+      // cell pattern as the curve editor's bin table and the tuner-ui
+      // table editor.
+      e.preventDefault();
+      finishCellEdit(x, y, true);
+      const nextX = e.key === 'ArrowRight' ? Math.min(x_size - 1, x + 1)
+        : e.key === 'ArrowLeft' ? Math.max(0, x - 1)
+        : x;
+      const nextY = e.key === 'ArrowDown' ? Math.min(y_size - 1, y + 1)
+        : e.key === 'ArrowUp' ? Math.max(0, y - 1)
+        : y;
+      if (!lockedCells?.has(`${nextX},${nextY}`)) {
+        setEditingCell([nextX, nextY]);
+        setEditValue(z_values[nextY][nextX].toFixed(2));
+      }
     }
   };
 
@@ -367,6 +387,21 @@ export default function TableGrid({
     } else if (e.key === 'Escape') {
       setEditingAxis(null);
       setEditValue('');
+    } else if (
+      editingAxis &&
+      ((editingAxis.axis === 'x' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) ||
+        (editingAxis.axis === 'y' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')))
+    ) {
+      // Same commit-then-move-to-the-neighbor pattern as the Z cells above.
+      // X headers only move Left/Right, Y headers only Up/Down - a single
+      // row/column of headers has no orthogonal neighbor.
+      e.preventDefault();
+      handleHeaderBlur();
+      const { axis, index } = editingAxis;
+      const length = axis === 'x' ? x_size : y_size;
+      const forward = axis === 'x' ? e.key === 'ArrowRight' : e.key === 'ArrowDown';
+      const nextIndex = Math.max(0, Math.min(length - 1, index + (forward ? 1 : -1)));
+      handleHeaderDoubleClick(axis, nextIndex);
     }
   };
 

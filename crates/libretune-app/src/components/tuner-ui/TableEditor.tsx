@@ -811,9 +811,26 @@ export function TableEditor({
       } else if (e.key === 'Escape') {
         setEditingAxis(null);
         setAxisEditValue('');
+      } else if (
+        editingAxis &&
+        ((editingAxis.axis === 'x' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) ||
+          (editingAxis.axis === 'y' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')))
+      ) {
+        // Same pattern as the Z-cell input and the curve editor's bin
+        // table: commit what's typed (same as Enter), then move to the
+        // next bin along this axis and open it for editing too. X headers
+        // only move Left/Right, Y headers only Up/Down - there's no
+        // orthogonal neighbor for a single row/column of headers.
+        e.preventDefault();
+        finishAxisEdit(true);
+        const { axis, index } = editingAxis;
+        const length = axis === 'x' ? data.xAxis.length : data.yAxis.length;
+        const forward = axis === 'x' ? e.key === 'ArrowRight' : e.key === 'ArrowDown';
+        const nextIndex = Math.max(0, Math.min(length - 1, index + (forward ? 1 : -1)));
+        handleAxisClick(axis, nextIndex);
       }
     },
-    [finishAxisEdit],
+    [finishAxisEdit, editingAxis, data.xAxis.length, data.yAxis.length, handleAxisClick],
   );
 
   // Keyboard navigation
@@ -1258,6 +1275,27 @@ export function TableEditor({
                             } else if (e.key === 'Escape') {
                               e.preventDefault();
                               finishEdit(false);
+                            } else if (
+                              e.key === 'ArrowLeft' || e.key === 'ArrowRight' ||
+                              e.key === 'ArrowUp' || e.key === 'ArrowDown'
+                            ) {
+                              // Commits what's typed so far (same as Enter),
+                              // then opens the neighboring cell for editing -
+                              // same arrow-key-moves-to-the-next-cell pattern
+                              // as the curve editor's bin table.
+                              e.preventDefault();
+                              finishEdit(true);
+                              const nextCol = e.key === 'ArrowRight'
+                                ? Math.min(data.xAxis.length - 1, colIndex + 1)
+                                : e.key === 'ArrowLeft'
+                                ? Math.max(0, colIndex - 1)
+                                : colIndex;
+                              const nextRow = e.key === 'ArrowDown'
+                                ? Math.min(data.yAxis.length - 1, rowIndex + 1)
+                                : e.key === 'ArrowUp'
+                                ? Math.max(0, rowIndex - 1)
+                                : rowIndex;
+                              openCellEdit(nextRow, nextCol);
                             }
                           }}
                         />
