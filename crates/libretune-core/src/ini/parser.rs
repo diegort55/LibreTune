@@ -1661,17 +1661,34 @@ fn parse_table_editor_entry(
         if let Some(table) = def.tables.get_mut(table_name) {
             match key.to_lowercase().as_str() {
                 "xbins" => {
-                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    // Format: xBins = binVariable[, displayVariable][, readOnly]
+                    // readOnly locks this axis from user edits - e.g. Long
+                    // Term Fuel Trim's RPM/load bins track the VE table's
+                    // own axes and would desync if edited here.
+                    let parts = split_ini_line(value);
                     if !parts.is_empty() {
-                        table.x_bins = parts[0].to_string();
-                        table.x_output_channel = parts.get(1).map(|s| s.to_string());
+                        table.x_bins = parts[0].trim().to_string();
+                        let rest = &parts[1..];
+                        table.x_output_channel = rest
+                            .iter()
+                            .find(|p| !p.trim().eq_ignore_ascii_case("readonly"))
+                            .map(|s| s.trim().to_string());
+                        table.x_bins_read_only =
+                            rest.iter().any(|p| p.trim().eq_ignore_ascii_case("readonly"));
                     }
                 }
                 "ybins" => {
-                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    // Format: yBins = binVariable[, displayVariable][, readOnly]
+                    let parts = split_ini_line(value);
                     if !parts.is_empty() {
-                        table.y_bins = Some(parts[0].to_string());
-                        table.y_output_channel = parts.get(1).map(|s| s.to_string());
+                        table.y_bins = Some(parts[0].trim().to_string());
+                        let rest = &parts[1..];
+                        table.y_output_channel = rest
+                            .iter()
+                            .find(|p| !p.trim().eq_ignore_ascii_case("readonly"))
+                            .map(|s| s.trim().to_string());
+                        table.y_bins_read_only =
+                            rest.iter().any(|p| p.trim().eq_ignore_ascii_case("readonly"));
                         table.table_type = super::tables::TableType::ThreeD;
                     }
                 }
@@ -1761,18 +1778,30 @@ fn parse_curve_editor_entry(
                     }
                 }
                 "xbins" => {
-                    // Format: xBins = binVariable, displayVariable
-                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    // Format: xBins = binVariable[, displayVariable][, readOnly]
+                    // readOnly locks this axis from user edits - a fixed
+                    // reference axis (e.g. a blend curve tracking a table's
+                    // own RPM/load bins) that would desync if edited here.
+                    let parts = split_ini_line(value);
                     if !parts.is_empty() {
-                        curve.x_bins = parts[0].to_string();
-                        curve.x_output_channel = parts.get(1).map(|s| s.to_string());
+                        curve.x_bins = parts[0].trim().to_string();
+                        let rest = &parts[1..];
+                        curve.x_output_channel = rest
+                            .iter()
+                            .find(|p| !p.trim().eq_ignore_ascii_case("readonly"))
+                            .map(|s| s.trim().to_string());
+                        curve.x_bins_read_only =
+                            rest.iter().any(|p| p.trim().eq_ignore_ascii_case("readonly"));
                     }
                 }
                 "ybins" => {
-                    // Format: yBins = valueVariable[, outputChannel]
+                    // Format: yBins = valueVariable[, outputChannel][, readOnly]
                     let parts = split_ini_line(value);
                     if !parts.is_empty() {
                         curve.y_bins = parts[0].trim().to_string();
+                        curve.y_bins_read_only = parts[1..]
+                            .iter()
+                            .any(|p| p.trim().eq_ignore_ascii_case("readonly"));
                     }
                 }
                 "size" => {
@@ -3333,6 +3362,84 @@ yAxis = 0, 2, 11
             curve.y_axis,
             Some(("0".to_string(), "2".to_string(), "11".to_string()))
         );
+    }
+
+    /// A curve's xBins/yBins can carry the same `readOnly` token
+    /// [TableEditor] tables use (see `table_bins_read_only_flag_is_captured`
+    /// below for rusEFI's actual real-world usage of it) - editing a locked
+    /// axis would desync it from whatever it's meant to track. The parser
+    /// previously ignored this token entirely (and dropped the output
+    /// channel too, for yBins).
+    #[test]
+    fn curve_bins_read_only_flag_is_captured() {
+        let ini = "[CurveEditor]
+curve = secondVeBias, \"Second VE blend bias\"
+xBins = veRpmBins, RPMValue, readOnly
+yBins = veLoadBins, veTableYAxis, readOnly
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("secondVeBias").expect("curve parsed");
+        assert_eq!(curve.x_bins, "veRpmBins");
+        assert_eq!(curve.x_output_channel, Some("RPMValue".to_string()));
+        assert!(curve.x_bins_read_only);
+        assert_eq!(curve.y_bins, "veLoadBins");
+        assert!(curve.y_bins_read_only);
+    }
+
+    /// A curve without the readOnly token stays editable - readOnly must
+    /// never be inferred, only ever explicit.
+    #[test]
+    fn curve_bins_without_read_only_token_stay_editable() {
+        let ini = "[CurveEditor]
+curve = secondVeBias, \"Second VE blend bias\"
+xBins = secondVeBlendBins, secondVeBlendParameter
+yBins = secondVeBlendValues
+";
+        let def = parse_ini(ini).expect("parses");
+        let curve = def.curves.get("secondVeBias").expect("curve parsed");
+        assert!(!curve.x_bins_read_only);
+        assert!(!curve.y_bins_read_only);
+    }
+
+    /// rusEFI's real INI: Long Term Fuel Trim Bank 1/2 track the VE table's
+    /// own RPM/load bins - `xBins = veRpmBins, RPMValue, readOnly` /
+    /// `yBins = veLoadBins, veTableYAxis, readOnly` - so editing them here
+    /// (they aren't LTFT's own bins) would silently desync the LTFT table
+    /// from the VE table it's meant to correct. `[TableEditor]`'s xBins/
+    /// yBins handlers used a naive `split(',')` that never looked past the
+    /// output channel, so this token was silently ignored.
+    #[test]
+    fn table_bins_read_only_flag_is_captured() {
+        let ini = "[TableEditor]
+table = ltftBank1Tbl, ltftBank1Map, \"Long Term Fuel Trim Bank 1\"
+xBins = veRpmBins, RPMValue, readOnly
+yBins = veLoadBins, veTableYAxis, readOnly
+zBins = ltft_table_bank1
+";
+        let def = parse_ini(ini).expect("parses");
+        let table = def.tables.get("ltftBank1Tbl").expect("table parsed");
+        assert_eq!(table.x_bins, "veRpmBins");
+        assert_eq!(table.x_output_channel, Some("RPMValue".to_string()));
+        assert!(table.x_bins_read_only);
+        assert_eq!(table.y_bins, Some("veLoadBins".to_string()));
+        assert_eq!(table.y_output_channel, Some("veTableYAxis".to_string()));
+        assert!(table.y_bins_read_only);
+    }
+
+    /// A table without the readOnly token stays editable - readOnly must
+    /// never be inferred, only ever explicit.
+    #[test]
+    fn table_bins_without_read_only_token_stay_editable() {
+        let ini = "[TableEditor]
+table = veTable1Tbl, veTable1, \"VE Table\", 2
+xBins = rpmBins, RPMValue
+yBins = mapBins, MAP
+zBins = veTable1
+";
+        let def = parse_ini(ini).expect("parses");
+        let table = def.tables.get("veTable1Tbl").expect("table parsed");
+        assert!(!table.x_bins_read_only);
+        assert!(!table.y_bins_read_only);
     }
 
     /// An INI picks metric units with `#if CELSIUS`. TunerStudio defines that

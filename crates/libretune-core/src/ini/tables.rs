@@ -29,11 +29,21 @@ pub struct TableDefinition {
     /// X-axis output channel for highlighting
     pub x_output_channel: Option<String>,
 
+    /// X bins are a fixed reference axis the INI marks `readOnly` (e.g. Long
+    /// Term Fuel Trim tracking the VE table's own RPM/load bins) - editing
+    /// them here would desync from what they're meant to track.
+    #[serde(default)]
+    pub x_bins_read_only: bool,
+
     /// Y-axis constant name (bins) - only for 3D tables
     pub y_bins: Option<String>,
 
     /// Y-axis output channel for highlighting - only for 3D tables
     pub y_output_channel: Option<String>,
+
+    /// See `x_bins_read_only`.
+    #[serde(default)]
+    pub y_bins_read_only: bool,
 
     /// Page number for the table data
     pub page: u8,
@@ -131,8 +141,10 @@ impl TableDefinition {
             map: map.into(),
             x_bins: x_bins.into(),
             x_output_channel: None,
+            x_bins_read_only: false,
             y_bins: None,
             y_output_channel: None,
+            y_bins_read_only: false,
             page: 0,
             x_size,
             y_size: 1,
@@ -167,8 +179,10 @@ impl TableDefinition {
             map: map.into(),
             x_bins: x_bins.into(),
             x_output_channel: None,
+            x_bins_read_only: false,
             y_bins: Some(y_bins.into()),
             y_output_channel: None,
+            y_bins_read_only: false,
             page: 0,
             x_size,
             y_size,
@@ -223,8 +237,16 @@ pub struct CurveDefinition {
     /// X-axis output channel for highlighting
     pub x_output_channel: Option<String>,
 
+    /// X bins are a fixed reference axis the INI marks `readOnly` (e.g. a
+    /// blend curve tracking a table's own RPM/load bins) - editing them here
+    /// would desync from what they're meant to track.
+    pub x_bins_read_only: bool,
+
     /// Y-axis constant name (values)
     pub y_bins: String,
+
+    /// See `x_bins_read_only`.
+    pub y_bins_read_only: bool,
 
     /// Column labels (X label, Y label)
     pub column_labels: (String, String),
@@ -262,7 +284,9 @@ impl CurveDefinition {
             title: String::new(),
             x_bins: x_bins.into(),
             x_output_channel: None,
+            x_bins_read_only: false,
             y_bins: y_bins.into(),
+            y_bins_read_only: false,
             column_labels: (String::new(), String::new()),
             x_axis: None,
             y_axis: None,
